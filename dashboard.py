@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from main import AngelMCXScanner
+from angel_mcx_scanner import AngelMCXScanner
 
 
 st.set_page_config(page_title="MCX Excel Board", layout="wide", initial_sidebar_state="expanded")
