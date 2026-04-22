@@ -127,7 +127,17 @@ class BankNiftyPaperBot:
         return float(data["data"]["ltp"])
 
     def parse_price(self, text, label):
-        match = re.search(rf"\b{label}\s*[:=]\s*(\d+(?:\.\d+)?)", text, re.I)
+        match = re.search(
+            rf"\b{label}\s*[:=]\s*(\d+(?:\.\d+)?)(?![\d.])(?!(?:\s*pts?\b))",
+            text,
+            re.I,
+        )
+        if not match:
+            return None
+        return float(match.group(1))
+
+    def parse_points(self, text, label):
+        match = re.search(rf"\b{label}\s*[:=]\s*(\d+(?:\.\d+)?)\s*pts?\b", text, re.I)
         if not match:
             return None
         return float(match.group(1))
@@ -136,11 +146,15 @@ class BankNiftyPaperBot:
         match = re.search(r"(?:ACTION:\s*)?BUY\s+BANKNIFTY\s+(\d+)\s+(CE|PE)", text, re.I)
         if not match:
             return None
+        option_type = match.group(2).upper()
         return {
             "strike": int(match.group(1)),
-            "option_type": match.group(2).upper(),
+            "option_type": option_type,
+            "signal_name": "CALL" if option_type == "CE" else "PUT",
             "entry": self.parse_price(text, "Entry"),
             "sl": self.parse_price(text, "SL"),
+            "sl_points": self.parse_points(text, "SL"),
+            "target_points": self.parse_points(text, "TARGET"),
             "targets": [
                 target
                 for target in (
@@ -171,12 +185,25 @@ class BankNiftyPaperBot:
 
         tradingsymbol, token = self.resolve_option(strike, option_type)
         entry = signal["entry"] or self.get_ltp(tradingsymbol, token)
-        sl = signal["sl"] if signal["sl"] is not None else entry - STEP_POINTS
-        targets = signal["targets"] or [
-            entry + STEP_POINTS,
-            entry + (STEP_POINTS * 2),
-            entry + (STEP_POINTS * 3),
-        ]
+        sl_points = signal["sl_points"] or STEP_POINTS
+        target_points = signal["target_points"]
+        sl = signal["sl"] if signal["sl"] is not None else entry - sl_points
+        if signal["targets"]:
+            targets = signal["targets"]
+        elif target_points:
+            targets = sorted(
+                {
+                    entry + STEP_POINTS,
+                    entry + target_points,
+                    entry + target_points + STEP_POINTS,
+                }
+            )
+        else:
+            targets = [
+                entry + STEP_POINTS,
+                entry + (STEP_POINTS * 2),
+                entry + (STEP_POINTS * 3),
+            ]
         trade = PaperTrade(
             symbol="BANKNIFTY",
             strike=strike,
@@ -292,16 +319,26 @@ def target_action_text(target_no, trade):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post or update.message
     if not msg or not msg.text:
+        print("Telegram update ignored: no text message", flush=True)
         return
 
     if TRADE_CHANNEL_ID and str(msg.chat_id) != str(TRADE_CHANNEL_ID):
+        print(
+            f"Telegram message ignored: chat_id {msg.chat_id} != configured {TRADE_CHANNEL_ID}",
+            flush=True,
+        )
         return
+
+    preview = msg.text.replace("\n", " ")[:160]
+    print(f"Telegram message received from {msg.chat_id}: {preview}", flush=True)
 
     signal = engine.parse_signal(msg.text)
     if not signal:
+        print("Telegram message ignored: no BANKNIFTY buy signal found", flush=True)
         return
 
     if not market_open():
+        print("Paper trade signal ignored: market closed", flush=True)
         await send_channel(context, "PAPER TRADE IGNORED: market closed")
         return
 
@@ -310,21 +347,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         trade, status = engine.enter_trade(signal)
     except Exception as exc:
+        print(f"Paper trade error: {exc}", flush=True)
         await send_channel(context, f"PAPER TRADE ERROR: {exc}")
         return
 
     if status == "OPEN_TRADE_EXISTS":
+        print("Paper trade ignored: one trade already open", flush=True)
         await send_channel(context, "PAPER TRADE IGNORED: one trade already open")
         return
     if status == "DUPLICATE_SIGNAL":
+        print(f"Paper trade ignored: duplicate {strike}{option_type}", flush=True)
         await send_channel(context, f"PAPER TRADE IGNORED: duplicate {strike}{option_type}")
         return
+
+    print(f"Paper trade entered: BANKNIFTY {strike} {option_type}", flush=True)
 
     await send_channel(
         context,
         "\n".join(
             [
                 f"BUY BANKNIFTY {trade.strike} {trade.option_type}",
+                f"{signal['signal_name']} BUY ALERT",
                 (
                     f"Entry: {trade.entry:.2f}, "
                     f"T1: {trade.target(1):.2f}, "
