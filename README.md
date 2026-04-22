@@ -3,10 +3,15 @@
 This bot reads Telegram channel alerts like:
 
 ```text
-ACTION: BUY BANKNIFTY 56500 PE
+BUY BANKNIFTY 56500 CE
+Entry: 200
+SL: 170
+T1: 230
+T2: 260
+T3: 290
 ```
 
-It creates a paper entry using Angel One live option LTP. It does not place live orders.
+It creates a paper entry from the alert price when provided, otherwise using Angel One live option LTP. It does not place live orders.
 
 ## Telegram Setup
 
@@ -77,11 +82,17 @@ python paper_trade_bot.py
 
 ## Trade Logic
 
-- Only reads `ACTION: BUY BANKNIFTY <strike> CE/PE`.
+- Reads `BUY BANKNIFTY <strike> CE/PE`.
+- `ACTION:` is optional for backward compatibility.
+- If `Entry`, `SL`, `T1`, `T2`, and `T3` are included, the bot uses those alert prices.
+- If prices are not included, the bot uses Angel One live option LTP and calculates levels.
 - Only one open paper trade.
 - Quantity: 1 BANKNIFTY lot.
 - Initial SL: entry - 30 points.
 - First target: entry + 30 points.
-- If T1 hits, SL moves to entry.
-- If T2 hits, SL moves to entry + 30.
-- Every extra 30-point move shifts SL by 30.
+- Sends live updates only when price moves above the last alerted price.
+- Down moves do not send alerts unless SL is hit.
+- If T1 hits, alert says exit or move SL cost to cost.
+- If T2 hits, alert says exit or move SL to T1.
+- If T3 hits, final target is hit and the paper trade closes.
+- If active SL is hit before the next target, the paper trade exits at SL.

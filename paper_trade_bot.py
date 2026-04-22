@@ -51,14 +51,17 @@ class PaperTrade:
     opened_at: datetime
     sl: float
     last_alert_ltp: float
+    targets: list
     highest_target_hit: int = 0
 
     def target(self, level):
+        if level <= len(self.targets):
+            return self.targets[level - 1]
         return self.entry + (STEP_POINTS * level)
 
     @property
     def next_target(self):
-        if self.highest_target_hit >= MAX_TARGET_LEVEL:
+        if self.highest_target_hit >= len(self.targets):
             return None
         return self.target(self.highest_target_hit + 1)
 
@@ -123,11 +126,31 @@ class BankNiftyPaperBot:
             raise RuntimeError(f"LTP failed: {data.get('message')}")
         return float(data["data"]["ltp"])
 
-    def parse_signal(self, text):
-        match = re.search(r"ACTION:\s*BUY\s+BANKNIFTY\s+(\d+)\s+(CE|PE)", text, re.I)
+    def parse_price(self, text, label):
+        match = re.search(rf"\b{label}\s*[:=]\s*(\d+(?:\.\d+)?)", text, re.I)
         if not match:
             return None
-        return int(match.group(1)), match.group(2).upper()
+        return float(match.group(1))
+
+    def parse_signal(self, text):
+        match = re.search(r"(?:ACTION:\s*)?BUY\s+BANKNIFTY\s+(\d+)\s+(CE|PE)", text, re.I)
+        if not match:
+            return None
+        return {
+            "strike": int(match.group(1)),
+            "option_type": match.group(2).upper(),
+            "entry": self.parse_price(text, "Entry"),
+            "sl": self.parse_price(text, "SL"),
+            "targets": [
+                target
+                for target in (
+                    self.parse_price(text, "T1"),
+                    self.parse_price(text, "T2"),
+                    self.parse_price(text, "T3"),
+                )
+                if target is not None
+            ],
+        }
 
     def is_duplicate(self, strike, option_type):
         key = f"{strike}{option_type}"
@@ -138,14 +161,22 @@ class BankNiftyPaperBot:
         self.last_signal[key] = now
         return False
 
-    def enter_trade(self, strike, option_type):
+    def enter_trade(self, signal):
+        strike = signal["strike"]
+        option_type = signal["option_type"]
         if self.open_trade is not None:
             return None, "OPEN_TRADE_EXISTS"
         if self.is_duplicate(strike, option_type):
             return None, "DUPLICATE_SIGNAL"
 
         tradingsymbol, token = self.resolve_option(strike, option_type)
-        entry = self.get_ltp(tradingsymbol, token)
+        entry = signal["entry"] or self.get_ltp(tradingsymbol, token)
+        sl = signal["sl"] if signal["sl"] is not None else entry - STEP_POINTS
+        targets = signal["targets"] or [
+            entry + STEP_POINTS,
+            entry + (STEP_POINTS * 2),
+            entry + (STEP_POINTS * 3),
+        ]
         trade = PaperTrade(
             symbol="BANKNIFTY",
             strike=strike,
@@ -155,8 +186,9 @@ class BankNiftyPaperBot:
             entry=entry,
             qty=LOT_SIZE,
             opened_at=datetime.now(IST),
-            sl=entry - STEP_POINTS,
+            sl=sl,
             last_alert_ltp=entry,
+            targets=targets,
         )
         self.open_trade = trade
         return trade, "ENTERED"
@@ -167,30 +199,36 @@ class BankNiftyPaperBot:
             return None
 
         ltp = self.get_ltp(trade.tradingsymbol, trade.token)
-        pnl = (ltp - trade.entry) * trade.qty
 
         if ltp <= trade.sl:
             closed = trade
+            exit_price = trade.sl
+            pnl = (exit_price - trade.entry) * trade.qty
             self.open_trade = None
             return {
                 "type": "EXIT",
                 "trade": closed,
                 "ltp": ltp,
+                "exit_price": exit_price,
                 "pnl": pnl,
                 "reason": "SL HIT",
             }
 
+        pnl = (ltp - trade.entry) * trade.qty
         next_target = trade.next_target
         if next_target is not None and ltp >= next_target:
             old_sl = trade.sl
             target_no = trade.highest_target_hit
-            while target_no < MAX_TARGET_LEVEL and ltp >= trade.target(target_no + 1):
+            while target_no < len(trade.targets) and ltp >= trade.target(target_no + 1):
                 target_no += 1
             trade.highest_target_hit = target_no
-            trade.sl = trade.entry + ((target_no - 1) * STEP_POINTS)
+            if target_no == 1:
+                trade.sl = trade.entry
+            elif target_no > 1:
+                trade.sl = trade.target(target_no - 1)
             trade.last_alert_ltp = max(trade.last_alert_ltp, ltp)
 
-            if target_no >= MAX_TARGET_LEVEL:
+            if target_no >= len(trade.targets):
                 closed = trade
                 self.open_trade = None
                 return {
@@ -243,6 +281,14 @@ def target_ladder_text(trade):
     )
 
 
+def target_action_text(target_no, trade):
+    if target_no == 1:
+        return f"T1 reached. Exit or move SL cost to cost: {trade.sl:.2f}"
+    if target_no == 2:
+        return f"T2 reached. Exit or move SL to T1: {trade.sl:.2f}"
+    return f"T{target_no} reached. Exit or trail SL: {trade.sl:.2f}"
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post or update.message
     if not msg or not msg.text:
@@ -259,9 +305,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_channel(context, "PAPER TRADE IGNORED: market closed")
         return
 
-    strike, option_type = signal
+    strike = signal["strike"]
+    option_type = signal["option_type"]
     try:
-        trade, status = engine.enter_trade(strike, option_type)
+        trade, status = engine.enter_trade(signal)
     except Exception as exc:
         await send_channel(context, f"PAPER TRADE ERROR: {exc}")
         return
@@ -309,8 +356,9 @@ async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
             context,
             "\n".join(
                 [
+                    "PRICE UP",
                     f"BANKNIFTY {trade.strike} {trade.option_type}",
-                    f"LTP: {event['ltp']:.2f}",
+                    f"Price: {event['ltp']:.2f}",
                     f"SL: {trade.sl:.2f}",
                     target_ladder_text(trade),
                 ]
@@ -321,9 +369,9 @@ async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
             context,
             "\n".join(
                 [
-                    f"T{event['target_no']} ACHIEVED - BOOK PROFIT OR RIDE",
+                    target_action_text(event["target_no"], trade),
                     f"BANKNIFTY {trade.strike} {trade.option_type}",
-                    f"LTP: {event['ltp']:.2f}",
+                    f"Price: {event['ltp']:.2f}",
                     f"P&L: {event['pnl']:.2f}",
                     f"SL SHIFT: {event['old_sl']:.2f} -> {trade.sl:.2f}",
                     target_ladder_text(trade),
@@ -335,9 +383,9 @@ async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
             context,
             "\n".join(
                 [
-                    "T3 ACHIEVED - FINAL BOOK PROFIT",
+                    "T3 reached. Final target hit - exit trade.",
                     f"BANKNIFTY {trade.strike} {trade.option_type}",
-                    f"LTP: {event['ltp']:.2f}",
+                    f"Price: {event['ltp']:.2f}",
                     f"Entry: {trade.entry:.2f}",
                     f"Booked P&L: {event['pnl']:.2f}",
                     f"SL SHIFT: {event['old_sl']:.2f} -> {trade.sl:.2f}",
@@ -351,9 +399,10 @@ async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
             context,
             "\n".join(
                 [
-                    "SL HIT - PAPER EXIT",
+                    "SL HIT - EXIT TRADE",
                     f"BANKNIFTY {trade.strike} {trade.option_type}",
-                    f"Exit: {event['ltp']:.2f}",
+                    f"Exit: {event['exit_price']:.2f}",
+                    f"Market price: {event['ltp']:.2f}",
                     f"Entry: {trade.entry:.2f}",
                     f"Booked P&L: {event['pnl']:.2f}",
                     target_ladder_text(trade),
