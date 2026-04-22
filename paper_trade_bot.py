@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 
@@ -13,10 +14,16 @@ from SmartApi.smartConnect import SmartConnect
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+# --- Logging Configuration ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 IST = pytz.timezone("Asia/Kolkata")
 LOT_SIZE = 30
 STEP_POINTS = 30
-MAX_TARGET_LEVEL = 3
 MAX_OPEN_TRADES = 1
 DUPLICATE_MINUTES = 10
 
@@ -55,12 +62,6 @@ class PaperTrade:
             return self.targets[level - 1]
         return self.entry + (STEP_POINTS * level)
 
-    @property
-    def next_target(self):
-        if self.highest_target_hit >= len(self.targets):
-            return None
-        return self.target(self.highest_target_hit + 1)
-
 class BankNiftyPaperBot:
     def __init__(self):
         self.smart = None
@@ -69,14 +70,18 @@ class BankNiftyPaperBot:
         self.last_signal = {}
 
     def login_angel(self):
+        logger.info("Attempting Angel One login...")
         totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
         smart = SmartConnect(api_key=ANGEL_API_KEY)
         session = smart.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
         if not session.get("status"):
+            logger.error(f"Angel login failed: {session.get('message')}")
             raise RuntimeError(f"Angel login failed: {session.get('message')}")
         self.smart = smart
+        logger.info("Angel login successful.")
 
     def load_instruments(self):
+        logger.info("Loading BANKNIFTY instruments...")
         if not os.path.exists(SCRIP_MASTER_FILE):
             response = requests.get(SCRIP_MASTER_URL, timeout=45)
             response.raise_for_status()
@@ -88,60 +93,70 @@ class BankNiftyPaperBot:
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         df = df[df["expiry_dt"] >= today].copy()
         self.instruments = df
+        logger.info(f"Loaded {len(df)} instruments.")
 
     def resolve_option(self, strike, option_type):
         if self.instruments is None: self.load_instruments()
         df = self.instruments
         df = df[df["symbol"].str.contains(f"{strike}{option_type}", na=False)].copy()
-        if df.empty: raise RuntimeError(f"No BANKNIFTY option found for {strike}{option_type}")
+        if df.empty: 
+            logger.error(f"No BANKNIFTY token found for {strike}{option_type}")
+            raise RuntimeError(f"No BANKNIFTY token found for {strike}{option_type}")
         nearest_expiry = df["expiry_dt"].min()
         row = df[df["expiry_dt"] == nearest_expiry].iloc[0]
         return str(row["symbol"]), str(row["token"])
 
     def get_ltp(self, tradingsymbol, token):
         data = self.smart.ltpData("NFO", tradingsymbol, token)
+        if not data.get("status"):
+            logger.warning(f"LTP fetch failed for {tradingsymbol}")
+            return 0.0
         return float(data["data"]["ltp"])
 
     def parse_signal(self, text):
-        # Improved Regex to catch "ACTION: BUY BANKNIFTY 57300 PE"
+        logger.info(f"Parsing message: {text[:50]}...")
+        # Match BUY BANKNIFTY [Strike] [Type]
         match = re.search(r"BUY\s+BANKNIFTY\s+(\d+)\s+(CE|PE)", text, re.I)
-        if not match: return None
+        if not match: 
+            logger.info("No signal match found in message.")
+            return None
         
         strike = int(match.group(1))
         option_type = match.group(2).upper()
         
-        # Extract SL and Target numbers even if they have "pts"
         sl_match = re.search(r"SL:\s*(\d+)", text, re.I)
         tg_match = re.search(r"TARGET:\s*(\d+)", text, re.I)
         
+        logger.info(f"Signal detected: {strike} {option_type}")
         return {
             "strike": strike,
             "option_type": option_type,
-            "signal_name": "CALL" if option_type == "CE" else "PUT",
-            "entry": None, # Force LTP entry
             "sl_points": float(sl_match.group(1)) if sl_match else STEP_POINTS,
-            "target_points": float(tg_match.group(1)) if tg_match else 60.0,
-            "targets": [],
-            "sl": None
+            "target_points": float(tg_match.group(1)) if tg_match else 60.0
         }
 
     def is_duplicate(self, strike, option_type):
         key = f"{strike}{option_type}"
         now = datetime.now(IST)
         last = self.last_signal.get(key)
-        if last and now - last < timedelta(minutes=DUPLICATE_MINUTES): return True
+        if last and now - last < timedelta(minutes=DUPLICATE_MINUTES):
+            logger.info(f"Duplicate signal ignored for {key}")
+            return True
         self.last_signal[key] = now
         return False
 
     def enter_trade(self, signal):
-        if self.open_trade is not None: return None, "OPEN_TRADE_EXISTS"
-        if self.is_duplicate(signal["strike"], signal["option_type"]): return None, "DUPLICATE_SIGNAL"
+        if self.open_trade:
+            logger.info("Trade ignored: One trade is already active.")
+            return None, "OPEN_TRADE_EXISTS"
+        if self.is_duplicate(signal["strike"], signal["option_type"]):
+            return None, "DUPLICATE_SIGNAL"
 
         symbol, token = self.resolve_option(signal["strike"], signal["option_type"])
         entry = self.get_ltp(symbol, token)
+        if entry == 0.0: return None, "LTP_ERROR"
+
         sl = entry - signal["sl_points"]
-        
-        # Calculate targets based on the 60 pts in your screenshot
         targets = [entry + 30, entry + signal["target_points"], entry + signal["target_points"] + 30]
         
         trade = PaperTrade(
@@ -150,6 +165,7 @@ class BankNiftyPaperBot:
             opened_at=datetime.now(IST), sl=sl, last_alert_ltp=entry, targets=targets
         )
         self.open_trade = trade
+        logger.info(f"Trade Entered: {symbol} at {entry}")
         return trade, "ENTERED"
 
     def update_trade(self):
@@ -157,35 +173,35 @@ class BankNiftyPaperBot:
         trade = self.open_trade
         ltp = self.get_ltp(trade.tradingsymbol, trade.token)
 
+        # SL Logic
         if ltp <= trade.sl:
-            pnl = (trade.sl - trade.entry) * trade.qty
+            logger.info(f"SL Hit for {trade.tradingsymbol} at {ltp}")
             self.open_trade = None
-            return {"type": "EXIT", "trade": trade, "ltp": ltp, "exit_price": trade.sl, "pnl": pnl, "reason": "SL HIT"}
+            return {"type": "EXIT", "trade": trade, "ltp": ltp}
 
-        if trade.next_target and ltp >= trade.next_target:
-            old_sl = trade.sl
+        # Target Logic
+        next_tg = trade.target(trade.highest_target_hit + 1)
+        if ltp >= next_tg:
             trade.highest_target_hit += 1
+            logger.info(f"Target {trade.highest_target_hit} hit at {ltp}")
             if trade.highest_target_hit == 1: trade.sl = trade.entry
-            elif trade.highest_target_hit > 1: trade.sl = trade.target(trade.highest_target_hit - 1)
+            elif trade.highest_target_hit == 2: trade.sl = trade.target(1)
             
             if trade.highest_target_hit >= 3:
                 self.open_trade = None
-                return {"type": "FINAL_TARGET", "trade": trade, "ltp": ltp, "pnl": (ltp - trade.entry) * trade.qty, "old_sl": old_sl}
-            return {"type": "TARGET", "trade": trade, "ltp": ltp, "pnl": (ltp - trade.entry) * trade.qty, "target_no": trade.highest_target_hit, "old_sl": old_sl}
+                return {"type": "FINAL_TARGET", "trade": trade, "ltp": ltp}
+            return {"type": "TARGET", "trade": trade, "ltp": ltp, "target_no": trade.highest_target_hit}
 
-        if ltp > trade.last_alert_ltp + 1:
-            trade.last_alert_ltp = ltp
-            return {"type": "PROGRESS", "trade": trade, "ltp": ltp, "pnl": (ltp - trade.entry) * trade.qty}
         return None
 
 engine = BankNiftyPaperBot()
 
 def market_open():
     now = datetime.now(IST).time()
-    return time(9, 15) <= now <= time(15, 30) # Market hours
-
-async def send_channel(context, text):
-    await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text=text)
+    is_open = time(9, 15) <= now <= time(15, 30)
+    if not is_open:
+        logger.info(f"Market Closed. Current time: {now}") # Logs "Market Closed"
+    return is_open
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post or update.message
@@ -195,12 +211,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not signal: return
 
     if not market_open():
-        await send_channel(context, "PAPER TRADE IGNORED: market closed")
+        await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text="PAPER TRADE IGNORED: market closed")
         return
 
     trade, status = engine.enter_trade(signal)
     if trade:
-        await send_channel(context, f"✅ PAPER TRADE ENTERED\nBUY BANKNIFTY {trade.strike} {trade.option_type}\nEntry: {trade.entry:.2f}\nSL: {trade.sl:.2f}\nT1: {trade.target(1):.2f}\nT2: {trade.target(2):.2f}")
+        text = (f"✅ **PAPER TRADE ENTERED**\n"
+                f"Instrument: {trade.strike} {trade.option_type}\n"
+                f"Entry: {trade.entry:.2f} | SL: {trade.sl:.2f}\n"
+                f"T1: {trade.target(1):.2f} | T2: {trade.target(2):.2f}")
+        await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text=text, parse_mode='Markdown')
 
 async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
     if not market_open() or not engine.open_trade: return
@@ -209,18 +229,22 @@ async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
     
     t = event["trade"]
     if event["type"] == "TARGET":
-        await send_channel(context, f"🎯 T{event['target_no']} HIT\n{t.strike} {t.option_type}\nLTP: {event['ltp']:.2f}\nNew SL: {t.sl:.2f}")
+        msg = f"🎯 **T{event['target_no']} HIT**\n{t.strike} {t.option_type} @ {event['ltp']:.2f}\nNew SL: {t.sl:.2f}"
     elif event["type"] == "FINAL_TARGET":
-        await send_channel(context, f"💰 FINAL TARGET HIT\n{t.strike} {t.option_type}\nClosed at: {event['ltp']:.2f}")
+        msg = f"💰 **FINAL TARGET HIT**\n{t.strike} {t.option_type} Closed @ {event['ltp']:.2f}"
     elif event["type"] == "EXIT":
-        await send_channel(context, f"❌ SL HIT\n{t.strike} {t.option_type}\nExit: {event['exit_price']:.2f}")
+        msg = f"❌ **SL HIT**\n{t.strike} {t.option_type} Exited @ {event['ltp']:.2f}"
+    
+    await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text=msg, parse_mode='Markdown')
 
 def main():
+    logger.info("Bot starting...")
     engine.login_angel()
     engine.load_instruments()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
     app.job_queue.run_repeating(monitor_trade, interval=3, first=3)
+    logger.info("Telegram polling started.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
