@@ -315,6 +315,20 @@ async def send_channel(context, text):
     await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text=text)
 
 
+def is_forwarded_message(msg):
+    return bool(
+        getattr(msg, "forward_origin", None)
+        or getattr(msg, "forward_from", None)
+        or getattr(msg, "forward_from_chat", None)
+    )
+
+
+def is_allowed_signal_source(msg):
+    if TRADE_CHANNEL_ID and str(msg.chat_id) == str(TRADE_CHANNEL_ID):
+        return True
+    return is_forwarded_message(msg)
+
+
 def target_ladder_text(trade):
     return "\n".join(
         f"🎯 T{level}: {trade.target(level):.2f}"
@@ -338,15 +352,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("Telegram update ignored: no text message", flush=True)
         return
 
-    if TRADE_CHANNEL_ID and str(msg.chat_id) != str(TRADE_CHANNEL_ID):
+    preview = msg.text.replace("\n", " ")[:160]
+    print(f"Telegram message received from {msg.chat_id}: {preview}", flush=True)
+
+    if not is_allowed_signal_source(msg):
         print(
-            f"Telegram message ignored: chat_id {msg.chat_id} != configured {TRADE_CHANNEL_ID}",
+            (
+                f"Telegram message ignored: chat_id {msg.chat_id} != configured "
+                f"{TRADE_CHANNEL_ID} and message is not forwarded"
+            ),
             flush=True,
         )
         return
-
-    preview = msg.text.replace("\n", " ")[:160]
-    print(f"Telegram message received from {msg.chat_id}: {preview}", flush=True)
 
     signal = engine.parse_signal(msg.text)
     if not signal:
