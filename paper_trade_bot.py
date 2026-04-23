@@ -1,9 +1,7 @@
-import json
-import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pyotp
@@ -18,20 +16,16 @@ IST = pytz.timezone("Asia/Kolkata")
 LOT_SIZE = 30
 STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
-MAX_OPEN_TRADES = 5   # ✅ MULTI TRADE ENABLED
+MAX_OPEN_TRADES = 3
 DUPLICATE_MINUTES = 10
 
-BASE_DIR = os.path.dirname(__file__)
-SCRIP_MASTER_FILE = os.path.join(BASE_DIR, "OpenAPIScripMaster.json")
+SCRIP_MASTER_FILE = "OpenAPIScripMaster.json"
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
+def env(n): return os.getenv(n)
 
-def env(name, default=None):
-    return os.getenv(name, default)
-
-
-TELEGRAM_BOT_TOKEN = env("PAPER_TRADE_BOT_TOKEN") or env("TELE_TOKEN_MCX")
-TRADE_CHANNEL_ID = env("PAPER_TRADE_CHANNEL_ID") or env("CHAT_ID_MCX")
+TELEGRAM_BOT_TOKEN = env("TELE_TOKEN_MCX")
+CHAT_ID = env("CHAT_ID_MCX")
 
 ANGEL_API_KEY = env("ANGEL_API_KEY")
 ANGEL_CLIENT_ID = env("ANGEL_CLIENT_ID")
@@ -40,172 +34,178 @@ ANGEL_TOTP_SECRET = env("ANGEL_TOTP_SECRET")
 
 
 @dataclass
-class PaperTrade:
-    symbol: str
+class Trade:
     strike: int
     option_type: str
-    tradingsymbol: str
+    ts: str
     token: str
     entry: float
-    qty: int
-    opened_at: datetime
     sl: float
-    last_alert_ltp: float
     targets: list
-    highest_target_hit: int = 0
-
-    def target(self, level):
-        return self.targets[level - 1]
-
-    @property
-    def next_target(self):
-        if self.highest_target_hit >= len(self.targets):
-            return None
-        return self.target(self.highest_target_hit + 1)
+    highest_target: int = 0
+    last_price_alert: float = 0
 
 
-class BankNiftyPaperBot:
+class Engine:
     def __init__(self):
         self.smart = None
-        self.instruments = None
-        self.open_trades = []   # ✅ MULTI TRADE
+        self.df = None
+        self.trades = []
         self.last_signal = {}
 
-    def login_angel(self):
+    def login(self):
         totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
         self.smart = SmartConnect(api_key=ANGEL_API_KEY)
         self.smart.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
 
-    def load_instruments(self):
+    def load(self):
         if not os.path.exists(SCRIP_MASTER_FILE):
             r = requests.get(SCRIP_MASTER_URL)
-            with open(SCRIP_MASTER_FILE, "wb") as f:
-                f.write(r.content)
+            open(SCRIP_MASTER_FILE, "wb").write(r.content)
 
         df = pd.read_json(SCRIP_MASTER_FILE)
-        df = df[(df["exch_seg"] == "NFO") & (df["name"] == "BANKNIFTY")].copy()
-        df["expiry_dt"] = pd.to_datetime(df["expiry"], format="%d%b%Y")
-        df = df[df["expiry_dt"] >= datetime.now()]
-        self.instruments = df
+        df = df[(df.exch_seg == "NFO") & (df.name == "BANKNIFTY")]
+        df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y")
+        self.df = df[df.expiry >= datetime.now()]
 
-    def resolve_option(self, strike, option_type):
-        df = self.instruments
-        df = df[df["symbol"].str.contains(f"{strike}{option_type}")]
-        row = df.sort_values("expiry_dt").iloc[0]
-        return str(row["symbol"]), str(row["token"])
+    def resolve(self, strike, opt):
+        df = self.df[self.df.symbol.str.contains(f"{strike}{opt}")]
+        row = df.sort_values("expiry").iloc[0]
+        return row.symbol, row.token
 
-    def get_ltp(self, ts, token):
+    def ltp(self, ts, token):
         return float(self.smart.ltpData("NFO", ts, token)["data"]["ltp"])
 
-    def parse_signal(self, text):
-        match = re.search(r"BANKNIFTY\s+(\d+)\s*(CE|PE)", text, re.I)
-        if not match:
-            return None
-        return {
-            "strike": int(match.group(1)),
-            "option_type": match.group(2).upper(),
-        }
+    def parse(self, txt):
+        m = re.search(r"BANKNIFTY\s+(\d+)\s*(CE|PE)", txt)
+        if not m: return None
+        return int(m.group(1)), m.group(2)
 
-    def is_duplicate(self, strike, option_type):
-        key = f"{strike}{option_type}"
+    def duplicate(self, k):
         now = datetime.now(IST)
-        last = self.last_signal.get(key)
-        if last and now - last < timedelta(minutes=DUPLICATE_MINUTES):
+        if k in self.last_signal and now - self.last_signal[k] < timedelta(minutes=10):
             return True
-        self.last_signal[key] = now
+        self.last_signal[k] = now
         return False
 
-    def enter_trade(self, signal):
-        if len(self.open_trades) >= MAX_OPEN_TRADES:
-            return None, "MAX_LIMIT"
+    def create_trade(self, strike, opt):
+        ts, token = self.resolve(strike, opt)
+        price = self.ltp(ts, token)
 
-        if self.is_duplicate(signal["strike"], signal["option_type"]):
-            return None, "DUPLICATE"
+        tgs = [price + STEP_POINTS * i for i in range(1, 5)]
 
-        ts, token = self.resolve_option(signal["strike"], signal["option_type"])
-        ltp = self.get_ltp(ts, token)
-
-        targets = [ltp + STEP_POINTS * i for i in range(1, 5)]
-
-        trade = PaperTrade(
-            symbol="BANKNIFTY",
-            strike=signal["strike"],
-            option_type=signal["option_type"],
-            tradingsymbol=ts,
-            token=token,
-            entry=ltp,
-            qty=LOT_SIZE,
-            opened_at=datetime.now(IST),
-            sl=ltp - STEP_POINTS,
-            last_alert_ltp=ltp,
-            targets=targets,
+        return Trade(
+            strike, opt, ts, token,
+            price,
+            price - STEP_POINTS,
+            tgs,
+            0,
+            price
         )
 
-        self.open_trades.append(trade)
-        return trade, "ENTERED"
+    def process_signal(self, strike, opt):
+        key = f"{strike}{opt}"
+        if self.duplicate(key):
+            return None, "DUP"
 
-    def update_trades(self):
-        events = []
+        # 🔁 reversal
+        for t in self.trades[:]:
+            if t.option_type != opt:
+                exit_price = self.ltp(t.ts, t.token)
+                self.trades.remove(t)
+                new_trade = self.create_trade(strike, opt)
+                self.trades.append(new_trade)
+                return ("REV", t, exit_price, new_trade)
 
-        for trade in self.open_trades[:]:
-            ltp = self.get_ltp(trade.tradingsymbol, trade.token)
+        if len(self.trades) >= MAX_OPEN_TRADES:
+            return None, "MAX"
 
-            if ltp <= trade.sl:
-                self.open_trades.remove(trade)
-                events.append(f"❌ SL HIT {trade.strike} {trade.option_type}")
+        t = self.create_trade(strike, opt)
+        self.trades.append(t)
+        return ("NEW", t)
+
+    def update(self):
+        msgs = []
+        for t in self.trades[:]:
+            price = self.ltp(t.ts, t.token)
+
+            # ❌ SL
+            if price <= t.sl:
+                self.trades.remove(t)
+                msgs.append(f"❌ BANKNIFTY {t.strike} {t.option_type} SL HIT")
                 continue
 
-            if trade.next_target and ltp >= trade.next_target:
-                trade.highest_target_hit += 1
-                trade.sl = trade.entry if trade.highest_target_hit == 1 else trade.targets[trade.highest_target_hit - 2]
-                events.append(f"🎯 T{trade.highest_target_hit} HIT {ltp}")
+            # 🎯 target
+            if t.highest_target < 4 and price >= t.targets[t.highest_target]:
+                t.highest_target += 1
+                t.sl = t.entry if t.highest_target == 1 else t.targets[t.highest_target - 2]
+                msgs.append(f"🎯 BANKNIFTY {t.strike} {t.option_type} T{t.highest_target} HIT @ {round(price)}")
 
-        return events
+            # 📈 ONLY UP MOVE ALERT
+            if int(price) > int(t.last_price_alert):
+                t.last_price_alert = price
+                msgs.append(f"📈 BANKNIFTY {t.strike} {t.option_type} @ {round(price)}")
+
+        return msgs
 
 
-engine = BankNiftyPaperBot()
+engine = Engine()
 
 
-async def send(context, text):
-    await context.bot.send_message(chat_id=TRADE_CHANNEL_ID, text=text)
+def format_trade(t):
+    return "\n".join([
+        f"🚀 BANKNIFTY {t.strike} {t.option_type} BUY @ {round(t.entry)}",
+        f"🛡️ SL: {round(t.sl)}",
+        f"🎯 T1: {round(t.targets[0])}",
+        f"🎯 T2: {round(t.targets[1])}",
+        f"🎯 T3: {round(t.targets[2])}",
+        f"🎯 T4: {round(t.targets[3])}",
+    ])
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send(ctx, txt):
+    await ctx.bot.send_message(chat_id=CHAT_ID, text=txt)
+
+
+async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post or update.message
     if not msg or not msg.text:
         return
 
-    # ✅ LOG EVERYTHING
-    print(f"MSG [{msg.chat_id}]: {msg.text[:120]}", flush=True)
+    print("MSG:", msg.text[:100])
 
-    signal = engine.parse_signal(msg.text)
-    if not signal:
+    parsed = engine.parse(msg.text)
+    if not parsed:
         return
 
-    trade, status = engine.enter_trade(signal)
+    strike, opt = parsed
+    res = engine.process_signal(strike, opt)
 
-    if status == "MAX_LIMIT":
-        await send(context, "⚠️ Max trades running")
-        return
-    if status == "DUPLICATE":
+    if not res:
         return
 
-    await send(context, f"🔥 BANKNIFTY {trade.strike} {trade.option_type} BUY @ {trade.entry}")
+    if res[0] == "REV":
+        _, old, exit_price, new = res
+        await send(ctx, f"🔁 EXIT BANKNIFTY {old.strike} {old.option_type} @ {round(exit_price)}")
+        await send(ctx, format_trade(new))
+
+    elif res[0] == "NEW":
+        _, t = res
+        await send(ctx, format_trade(t))
 
 
-async def monitor(context: ContextTypes.DEFAULT_TYPE):
-    events = engine.update_trades()
-    for e in events:
-        await send(context, e)
+async def monitor(ctx):
+    msgs = engine.update()
+    for m in msgs:
+        await send(ctx, m)
 
 
 def main():
-    print("Starting bot...")
-    engine.login_angel()
-    engine.load_instruments()
+    engine.login()
+    engine.load()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT, handle))
     app.job_queue.run_repeating(monitor, interval=3)
 
     app.run_polling()
