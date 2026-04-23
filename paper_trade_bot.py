@@ -370,11 +370,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("Telegram message ignored: no BANKNIFTY buy signal found", flush=True)
         return
 
-    if not market_open():
-        print("Paper trade signal ignored: market closed", flush=True)
-        await send_channel(context, "PAPER TRADE IGNORED: market closed")
-        return
-
     strike = signal["strike"]
     option_type = signal["option_type"]
     try:
@@ -410,7 +405,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monitor_trade(context: ContextTypes.DEFAULT_TYPE):
-    if not market_open() or engine.open_trade is None:
+    if engine.open_trade is None:
         return
     try:
         event = engine.update_trade()
