@@ -190,7 +190,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status == "DUPLICATE":
         return
 
-    await send(context, f"🔥 ENTRY {trade.strike} {trade.option_type} @ {trade.entry}")
+    await send(context, f"🔥 BANKNIFTY {trade.strike} {trade.option_type} BUY @ {trade.entry}")
 
 
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
