@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==21.7
+telethon
 smartapi-python
 logzero
 websocket-client
