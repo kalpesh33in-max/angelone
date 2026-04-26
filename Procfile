@@ -1,1 +1,1 @@
-worker: python paper_trade_bot.py
+worker: python angel_mcx_scanner.py

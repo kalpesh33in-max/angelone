@@ -1,8 +1,8 @@
-telethon
 smartapi-python
 logzero
 websocket-client
 pyotp
 pandas
 requests
-pytz
+streamlit
+telethon
