@@ -56,9 +56,11 @@ class Future1HModule:
 
     def start(self):
         self.instruments = load_nfo_futures()
+        print(f"Futures 1H module loaded {len(self.instruments)} nearest NFO futures.")
         self.prepare_setups()
         self.engine.subscribe_tokens(EXCHANGE_TYPE_NFO, list(self.setups.keys()))
         self.engine.register(self)
+        print(f"Futures 1H module registered with {len(self.setups)} active setups.")
         if not self.startup_alert_sent:
             send_future_scanner_alert("Angel One NFO 1H Futures Scanner Started")
             self.startup_alert_sent = True
@@ -68,6 +70,7 @@ class Future1HModule:
         now = datetime.now(IST)
         logic_hour, logic_minute = [int(part) for part in LOGIC_START_TIME.split(":", 1)]
         logic_start = now.replace(hour=logic_hour, minute=logic_minute, second=0, microsecond=0)
+        print(f"Preparing 1H futures setups at {now.strftime('%Y-%m-%d %H:%M:%S')} IST")
         if now < logic_start:
             print(f"Waiting until {LOGIC_START_TIME} IST for first 1H candle completion.")
             return
@@ -86,6 +89,8 @@ class Future1HModule:
             time.sleep(0.2)
 
         print(f"Prepared {len(self.setups)} active 1H setups.")
+        if not self.setups:
+            print("No active 1H setups were built. This can happen on market-off days or when no symbols match the current rules.")
 
     def _fetch_minute_df_with_retry(self, token, from_dt, to_dt, max_attempts=3):
         last_exc = None

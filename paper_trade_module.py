@@ -44,6 +44,7 @@ class PaperTradeModule:
 
     def start(self):
         self.engine.register(self)
+        print("Paper trade module registered on shared market-data engine.")
         self._start_telegram_listener()
 
     def _start_telegram_listener(self):
@@ -51,6 +52,7 @@ class PaperTradeModule:
             print("Paper trade Telegram listener disabled: missing TG_API_ID/TG_API_HASH/TG_SESSION_STR")
             return
 
+        print("Starting paper trade Telegram listener thread...")
         threading.Thread(target=self._telegram_thread_main, daemon=True).start()
 
     def _telegram_thread_main(self):
@@ -147,6 +149,7 @@ class PaperTradeModule:
     def process_signal(self, strike, option_type):
         key = f"{strike}{option_type}"
         if self.duplicate(key):
+            print(f"Duplicate paper trade signal ignored: {key}")
             return None
 
         if self.trade and self.trade.option_type != option_type:
@@ -158,9 +161,11 @@ class PaperTradeModule:
             return ("REV", old_trade, exit_price, self.trade)
 
         if self.trade:
+            print("Paper trade signal ignored: active trade already open in same direction.")
             return None
 
         self.trade = self.create_trade(strike, option_type)
+        print(f"Paper trade created: BANKNIFTY {strike} {option_type}")
         return ("NEW", self.trade)
 
     def on_tick(self, token, tick):
