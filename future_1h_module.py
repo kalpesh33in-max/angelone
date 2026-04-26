@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -17,8 +17,11 @@ from telegram_utils import send_future_scanner_alert
 
 IST = ZoneInfo("Asia/Kolkata")
 INTERVAL_1M = "ONE_MINUTE"
-INTERVAL_1H = "ONE_HOUR"
 EXCHANGE_TYPE_NFO = 2
+FIRST_HOUR_START = dt_time(9, 15)
+FIRST_HOUR_END = dt_time(10, 14)
+PREV_CLOSE_HOUR_START = dt_time(14, 30)
+PREV_CLOSE_HOUR_END = dt_time(15, 29)
 
 
 @dataclass
@@ -74,43 +77,53 @@ class Future1HModule:
 
         for token, inst in self.instruments.items():
             try:
-                hour_df = fetch_candle_df(
-                    self.smart,
-                    "NFO",
-                    token,
-                    INTERVAL_1H,
-                    from_day.replace(hour=9, minute=15, second=0, microsecond=0),
-                    now,
-                )
-                minute_df = fetch_candle_df(
-                    self.smart,
-                    "NFO",
-                    token,
-                    INTERVAL_1M,
-                    now.replace(hour=9, minute=15, second=0, microsecond=0),
-                    now,
-                )
-                setup = self._build_setup(token, inst, hour_df, minute_df, today)
+                minute_df = self._fetch_minute_df_with_retry(token, from_day.replace(hour=9, minute=15, second=0, microsecond=0), now)
+                setup = self._build_setup(token, inst, minute_df, today)
                 if setup:
                     self.setups[token] = setup
             except Exception as exc:
                 print(f"Setup build failed for {inst['symbol']}: {exc}")
+            time.sleep(0.2)
 
         print(f"Prepared {len(self.setups)} active 1H setups.")
 
-    def _build_setup(self, token, inst, hour_df, minute_df, today):
-        if hour_df.empty or minute_df.empty:
+    def _fetch_minute_df_with_retry(self, token, from_dt, to_dt, max_attempts=3):
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return fetch_candle_df(
+                    self.smart,
+                    "NFO",
+                    token,
+                    INTERVAL_1M,
+                    from_dt,
+                    to_dt,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if "exceeding access rate" in str(exc).lower() and attempt < max_attempts:
+                    time.sleep(2 * attempt)
+                    continue
+                raise
+        raise last_exc
+
+    def _build_setup(self, token, inst, minute_df, today):
+        if minute_df.empty:
             return None
 
         minute_today = minute_df[minute_df["timestamp"].dt.date == today].copy()
-        hour_today = hour_df[hour_df["timestamp"].dt.date == today].copy()
-        prev_hour = hour_df[hour_df["timestamp"].dt.date < today].copy()
-        if minute_today.empty or hour_today.empty or prev_hour.empty:
+        if minute_today.empty:
             return None
 
-        first_hour = hour_today.iloc[0]
-        prev_day_close = float(prev_hour.iloc[-1]["close"])
-        prev_hour_volume = float(prev_hour.iloc[-1]["volume"])
+        prev_dates = sorted(date for date in minute_df["timestamp"].dt.date.unique() if date < today)
+        if not prev_dates:
+            return None
+        prev_day = prev_dates[-1]
+        minute_prev_day = minute_df[minute_df["timestamp"].dt.date == prev_day].copy()
+        if minute_prev_day.empty:
+            return None
+
+        prev_day_close = float(minute_prev_day.iloc[-1]["close"])
         today_open = float(minute_today.iloc[0]["open"])
         gap_percent = ((today_open - prev_day_close) / prev_day_close) * 100 if prev_day_close else 0.0
 
@@ -121,11 +134,28 @@ class Future1HModule:
         else:
             opening_type = "FLAT OPENING"
 
-        first_open = float(first_hour["open"])
-        first_close = float(first_hour["close"])
-        first_high = float(first_hour["high"])
-        first_low = float(first_hour["low"])
-        first_volume = float(first_hour["volume"])
+        first_hour_df = minute_today[
+            (minute_today["timestamp"].dt.time >= FIRST_HOUR_START) &
+            (minute_today["timestamp"].dt.time <= FIRST_HOUR_END)
+        ].copy()
+        if first_hour_df.empty:
+            return None
+
+        prev_close_hour_df = minute_prev_day[
+            (minute_prev_day["timestamp"].dt.time >= PREV_CLOSE_HOUR_START) &
+            (minute_prev_day["timestamp"].dt.time <= PREV_CLOSE_HOUR_END)
+        ].copy()
+        if prev_close_hour_df.empty:
+            prev_close_hour_df = minute_prev_day.tail(60).copy()
+        if prev_close_hour_df.empty:
+            return None
+
+        first_open = float(first_hour_df.iloc[0]["open"])
+        first_close = float(first_hour_df.iloc[-1]["close"])
+        first_high = float(first_hour_df["high"].max())
+        first_low = float(first_hour_df["low"].min())
+        first_volume = float(pd.to_numeric(first_hour_df["volume"], errors="coerce").fillna(0.0).sum())
+        prev_hour_volume = float(pd.to_numeric(prev_close_hour_df["volume"], errors="coerce").fillna(0.0).sum())
 
         if first_close > first_open:
             color = "GREEN"

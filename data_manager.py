@@ -46,6 +46,8 @@ def load_nfo_futures(max_symbols=None):
             nfo_df["instrumenttype"].isin(["FUTIDX", "FUTSTK"]) |
             nfo_df["symbol"].astype(str).str.contains("FUT", na=False)
         ].copy()
+        nfo_df = nfo_df[~nfo_df["symbol"].astype(str).str.contains("NSETEST", na=False)].copy()
+        nfo_df = nfo_df[~nfo_df["name"].astype(str).str.contains("NSETEST", na=False)].copy()
 
         if nfo_df.empty:
             return {}
