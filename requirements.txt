@@ -1,8 +1,6 @@
 smartapi-python
-logzero
 websocket-client
 pyotp
 pandas
 requests
-streamlit
 telethon
