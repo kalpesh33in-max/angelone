@@ -45,6 +45,7 @@ class PaperTradeModule:
     def start(self):
         self.engine.register(self)
         print("Paper trade module registered on shared market-data engine.")
+        send_paper_trade_alert("Paper Trade Scanner Started")
         self._start_telegram_listener()
 
     def _start_telegram_listener(self):
