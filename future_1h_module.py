@@ -1,4 +1,5 @@
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
@@ -53,17 +54,35 @@ class Future1HModule:
         self.instruments = {}
         self.setups = {}
         self.startup_alert_sent = False
+        self.setup_thread = None
+        self.setup_in_progress = False
 
     def start(self):
         self.instruments = load_nfo_futures()
         print(f"Futures 1H module loaded {len(self.instruments)} nearest NFO futures.")
-        self.prepare_setups()
-        self.engine.subscribe_tokens(EXCHANGE_TYPE_NFO, list(self.setups.keys()))
         self.engine.register(self)
-        print(f"Futures 1H module registered with {len(self.setups)} active setups.")
+        print("Futures 1H module registered on shared market-data engine.")
         if not self.startup_alert_sent:
             send_future_scanner_alert("Angel One NFO 1H Futures Scanner Started")
             self.startup_alert_sent = True
+        self.start_background_setup()
+
+    def start_background_setup(self):
+        if self.setup_in_progress:
+            print("Futures 1H setup is already in progress.")
+            return
+        print("Starting futures 1H setup worker thread...")
+        self.setup_thread = threading.Thread(target=self._setup_worker, daemon=True)
+        self.setup_thread.start()
+
+    def _setup_worker(self):
+        self.setup_in_progress = True
+        try:
+            self.prepare_setups()
+            self.engine.subscribe_tokens(EXCHANGE_TYPE_NFO, list(self.setups.keys()))
+            print(f"Futures 1H module activated with {len(self.setups)} active setups.")
+        finally:
+            self.setup_in_progress = False
 
     def prepare_setups(self):
         self.setups = {}

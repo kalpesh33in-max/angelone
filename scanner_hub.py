@@ -7,8 +7,10 @@ from paper_trade_module import PaperTradeModule
 
 
 def main():
+    print("Starting scanner hub...")
     smart, session_data = get_angel_session()
     if not smart:
+        print("Angel One login failed. Scanner hub exiting.")
         return
 
     engine = MarketDataEngine(smart, session_data)
@@ -16,8 +18,11 @@ def main():
     paper_trade = PaperTradeModule(engine)
     futures_1h = Future1HModule(engine)
 
-    futures_1h.start()
+    print("Initializing paper trade module...")
     paper_trade.start()
+    print("Initializing futures 1H module...")
+    futures_1h.start()
+    print("Connecting shared Angel One WebSocket...")
     engine.connect()
 
     print("Scanner hub started: shared Angel One WebSocket feeding paper trade and 1H futures scanners.")
@@ -25,6 +30,8 @@ def main():
         try:
             if not engine.ws_connected and engine.ws is None:
                 engine.connect()
+            if not futures_1h.setups and not futures_1h.setup_in_progress:
+                futures_1h.start_background_setup()
             time.sleep(5)
         except KeyboardInterrupt:
             print("Scanner hub stopped by user.")
