@@ -292,6 +292,7 @@ class OptionBurstModule:
 
     def on_tick(self, token, tick):
         token = str(token)
+        now_dt = datetime.now(IST)
         if token in self.underlying_tokens:
             underlying_name = self.underlying_tokens[token]
             self.underlying_prices[underlying_name] = float(tick["ltp"])
@@ -378,7 +379,6 @@ class OptionBurstModule:
         rolling_oi_change = total_oi - float(rolling_base["oi"])
         tick_lots = int(abs(rolling_oi_change) / state.lot_size)
         pending = self.pending_confirmations.get(token)
-        now_dt = datetime.now(IST)
 
         if pending is None and tick_lots >= state.threshold_lots:
             self.pending_confirmations[token] = {
