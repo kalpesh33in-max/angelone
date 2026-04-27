@@ -42,6 +42,21 @@ class PaperTradeModule:
         self.last_signal = {}
         self.client = None
 
+    def _normalize_option_price(self, price, strike=None):
+        if price is None:
+            return None
+
+        price = float(price)
+        if price <= 0:
+            return None
+
+        # Angel One option prices can arrive in paise while the rest of the
+        # module assumes rupee premiums. Restrict the heuristic to large
+        # BANKNIFTY option values so the shared futures scanner is unaffected.
+        if strike and price >= max(1000.0, strike / 10):
+            return price / 100.0
+        return price
+
     def start(self):
         self.engine.register(self)
         print("Paper trade module registered on shared market-data engine.")
@@ -133,6 +148,9 @@ class PaperTradeModule:
         price = self.engine.get_latest_price(token)
         if price is None:
             price = self.engine.get_ltp_snapshot("NFO", symbol, token)
+        price = self._normalize_option_price(price, strike)
+        if price is None:
+            raise ValueError(f"Invalid option price for BANKNIFTY {strike} {option_type}")
 
         targets = [price + STEP_POINTS * i for i in range(1, MAX_TARGET_LEVEL + 1)]
         return Trade(
@@ -157,6 +175,7 @@ class PaperTradeModule:
             exit_price = self.engine.get_latest_price(self.trade.token)
             if exit_price is None:
                 exit_price = self.engine.get_ltp_snapshot("NFO", self.trade.symbol, self.trade.token)
+            exit_price = self._normalize_option_price(exit_price, self.trade.strike)
             old_trade = self.trade
             self.trade = self.create_trade(strike, option_type)
             return ("REV", old_trade, exit_price, self.trade)
@@ -173,7 +192,9 @@ class PaperTradeModule:
         if not self.trade or token != self.trade.token:
             return
 
-        price = tick["ltp"]
+        price = self._normalize_option_price(tick["ltp"], self.trade.strike)
+        if price is None:
+            return
         trade = self.trade
 
         if price <= trade.sl:

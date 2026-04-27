@@ -98,6 +98,92 @@ def load_nfo_options_for_name(base_name):
         return pd.DataFrame()
 
 
+def load_option_contracts(base_name, expiry_count=3):
+    try:
+        df = _load_scrip_master_df()
+        today = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+        options_df = df[df["name"] == base_name].copy()
+        options_df = options_df[options_df["expiry_dt"] >= today].copy()
+        options_df = options_df[
+            options_df["instrumenttype"].isin(["OPTIDX", "OPTFUT"]) |
+            options_df["symbol"].astype(str).str.contains("CE|PE", na=False)
+        ].copy()
+        if options_df.empty:
+            return pd.DataFrame()
+
+        expiries = sorted(options_df["expiry_dt"].dropna().unique())[:expiry_count]
+        if not expiries:
+            return pd.DataFrame()
+
+        labels = ["NEAR", "NEXT", "MONTH"]
+        expiry_buckets = {expiry: labels[idx] if idx < len(labels) else f"EXP{idx + 1}" for idx, expiry in enumerate(expiries)}
+
+        options_df = options_df[options_df["expiry_dt"].isin(expiries)].copy()
+        options_df["token"] = options_df["token"].astype(str)
+        options_df["lotsize"] = pd.to_numeric(options_df["lotsize"], errors="coerce").fillna(0).astype(int)
+        options_df["strike_value"] = pd.to_numeric(options_df["strike"], errors="coerce").fillna(0.0) / 100.0
+        options_df["option_type"] = options_df["symbol"].astype(str).str.extract(r"(CE|PE)", expand=False)
+        options_df["expiry_bucket"] = options_df["expiry_dt"].map(expiry_buckets)
+        return options_df.sort_values(["expiry_dt", "strike_value", "symbol"]).reset_index(drop=True)
+    except Exception as e:
+        print(f"Error loading option contracts for {base_name}: {e}")
+        return pd.DataFrame()
+
+
+def resolve_underlying_instrument(base_name):
+    try:
+        df = _load_scrip_master_df()
+        today = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+        if base_name == "CRUDEOIL":
+            fut_df = df[df["name"] == base_name].copy()
+            fut_df = fut_df[fut_df["instrumenttype"] == "FUTCOM"].copy()
+            fut_df = fut_df[fut_df["expiry_dt"] >= today].copy()
+            if fut_df.empty:
+                return None
+            row = fut_df.sort_values(["expiry_dt", "symbol"]).iloc[0]
+            return {
+                "token": str(row["token"]),
+                "symbol": str(row["symbol"]),
+                "exchange": "MCX",
+                "exchange_type": 5,
+                "source": "FUTURE",
+            }
+
+        candidates = df[df["name"] == base_name].copy()
+        if candidates.empty:
+            return None
+
+        preferred = candidates[
+            (candidates["symbol"].astype(str) == base_name) &
+            candidates["exch_seg"].astype(str).isin(["NSE", "BSE"])
+        ].copy()
+        if preferred.empty:
+            preferred = candidates[
+                candidates["instrumenttype"].astype(str).isin(["AMXIDX", ""])
+            ].copy()
+        if preferred.empty:
+            return None
+
+        row = preferred.sort_values(["exch_seg", "symbol"]).iloc[0]
+        exchange = str(row["exch_seg"])
+        exchange_type = 1 if exchange == "NSE" else 3 if exchange == "BSE" else None
+        if exchange_type is None:
+            return None
+
+        return {
+            "token": str(row["token"]),
+            "symbol": str(row["symbol"]),
+            "exchange": exchange,
+            "exchange_type": exchange_type,
+            "source": "SPOT",
+        }
+    except Exception as e:
+        print(f"Error resolving underlying instrument for {base_name}: {e}")
+        return None
+
+
 def resolve_nfo_option(base_name, strike, option_type):
     options_df = load_nfo_options_for_name(base_name)
     if options_df.empty:

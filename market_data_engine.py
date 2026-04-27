@@ -56,7 +56,10 @@ class MarketDataEngine:
         for exchange_type, tokens in self.subscriptions.items():
             token_list = list(tokens)
             if token_list:
+                print(f"Subscribing exchangeType={exchange_type} to {len(token_list)} tokens.")
                 self._subscribe_chunk(exchange_type, token_list)
+            else:
+                print(f"No tokens queued yet for exchangeType={exchange_type}.")
 
     def _subscribe_chunk(self, exchange_type, tokens):
         chunk_size = 50
@@ -108,7 +111,7 @@ class MarketDataEngine:
     def on_close(self, ws):
         self.ws_connected = False
         self.ws = None
-        print("Shared WebSocket closed.")
+        print("Shared WebSocket closed. Will reconnect from scanner hub loop.")
 
     def get_latest_price(self, token):
         tick = self.latest_ticks.get(str(token))

@@ -38,6 +38,10 @@ def send_telegram_mcx(message):
 
 
 def send_future_scanner_alert(message):
+    if not FUTURE_SCANNER_TELE_TOKEN or not FUTURE_SCANNER_CHAT_ID:
+        print("Future scanner Telegram credentials missing.")
+        return None
+
     return send_telegram_message(
         message,
         token=FUTURE_SCANNER_TELE_TOKEN,
