@@ -2,6 +2,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -48,6 +49,7 @@ class ContractState:
     baseline_price: float | None = None
     last_price: float | None = None
     last_oi: float | None = None
+    last_volume: float | None = None
     last_alert_bucket: int = 0
     last_alert_at: float = 0.0
 
@@ -66,6 +68,7 @@ class OptionBurstModule:
         self.startup_alert_sent = False
         self._refresh_lock = threading.Lock()
         self.debug_counts = {}
+        self.pending_confirmations = {}
 
     def start(self):
         self.engine.register(self)
@@ -272,14 +275,14 @@ class OptionBurstModule:
 
     def _strike_label(self, state, underlying_price, lots):
         diff = underlying_price - state.strike if state.option_type == "CE" else state.strike - underlying_price
-        prefix = "NEAR-ITM" if abs(diff) <= state.strike_step + 1e-6 else "ITM"
+        prefix = "ITM"
         suffix = "-HIGHLOTS" if lots >= state.threshold_lots * HIGH_LOTS_MULTIPLIER else ""
         return f"{prefix}-{abs(diff):.1f}-diff{suffix}"
 
-    def _turnover_cr(self, flow_label, delta_qty, price, delta_oi_lots):
+    def _turnover_cr(self, flow_label, qty, price, oi_lots):
         if flow_label in {"WRITER", "SHORT COVERING"}:
-            return max(delta_oi_lots, 0.0) * 100000.0 / 10000000.0
-        return (delta_qty * price) / 10000000.0
+            return max(oi_lots, 0.0) * 100000.0 / 10000000.0
+        return (qty * price) / 10000000.0
 
     def on_tick(self, token, tick):
         token = str(token)
@@ -329,59 +332,77 @@ class OptionBurstModule:
             state.baseline_price = price
             state.last_price = price
             state.last_oi = total_oi
+            state.last_volume = total_volume
             return
 
-        delta_qty = max(total_volume - state.baseline_volume, 0.0)
-        lots = math.floor(delta_qty / state.lot_size)
-        if lots < state.threshold_lots:
-            if state.underlying_name == "CRUDEOIL" and debug_count < 12:
+        prev_oi = state.last_oi if state.last_oi is not None else state.baseline_oi
+        prev_price = state.last_price if state.last_price is not None else state.baseline_price
+        prev_volume = state.last_volume if state.last_volume is not None else state.baseline_volume
+
+        tick_oi_change = total_oi - float(prev_oi)
+        tick_lots = int(abs(tick_oi_change) / state.lot_size)
+        pending = self.pending_confirmations.get(token)
+        now_dt = datetime.now(IST)
+
+        if pending is None and tick_lots >= state.threshold_lots:
+            self.pending_confirmations[token] = {
+                "time": now_dt,
+                "baseline_oi": float(prev_oi),
+                "baseline_price": float(prev_price),
+                "baseline_volume": float(prev_volume),
+            }
+            if state.underlying_name == "CRUDEOIL":
                 print(
-                    f"DEBUG CRUDEOIL below threshold symbol={state.symbol} "
-                    f"lots={lots} qty={int(delta_qty)} threshold={state.threshold_lots}"
+                    f"DEBUG CRUDEOIL pending created symbol={state.symbol} "
+                    f"tick_lots={tick_lots} threshold={state.threshold_lots}"
                 )
-                self.debug_counts[debug_key] = debug_count + 1
-            state.last_price = price
-            state.last_oi = total_oi
-            return
+        elif pending is not None:
+            confirmed_oi_change = total_oi - float(pending["baseline_oi"])
+            confirmed_lots = int(abs(confirmed_oi_change) / state.lot_size)
 
-        alert_bucket = lots // state.threshold_lots
-        now = time.time()
-        if alert_bucket <= state.last_alert_bucket or now - state.last_alert_at < ALERT_COOLDOWN_SECONDS:
-            state.last_price = price
-            state.last_oi = total_oi
-            return
+            if confirmed_lots < state.threshold_lots:
+                self.pending_confirmations.pop(token, None)
+                if state.underlying_name == "CRUDEOIL":
+                    print(
+                        f"DEBUG CRUDEOIL pending dropped symbol={state.symbol} "
+                        f"confirmed_lots={confirmed_lots} threshold={state.threshold_lots}"
+                    )
+            elif (now_dt - pending["time"]).total_seconds() >= ALERT_COOLDOWN_SECONDS:
+                price_change = price - float(pending["baseline_price"])
+                qty = confirmed_lots * state.lot_size
+                flow_label, flow_suffix = self._classify_flow(price_change, confirmed_oi_change)
+                turnover = self._turnover_cr(flow_label, qty, price, confirmed_lots)
+                strike_label = self._strike_label(state, underlying_price, confirmed_lots)
+                underlying_label = "Fut Price" if state.underlying_name == "CRUDEOIL" else "Spot Price"
 
-        previous_price = state.last_price if state.last_price is not None else state.baseline_price
-        previous_oi = state.last_oi if state.last_oi is not None else state.baseline_oi
-        delta_price = price - float(previous_price)
-        delta_oi = total_oi - float(previous_oi)
-        if abs(delta_oi) < state.lot_size:
-            state.last_price = price
-            state.last_oi = total_oi
-            return
+                lines = [
+                    f"{state.symbol} ({strike_label})",
+                    f"⚡ {flow_label}" + (f" {flow_suffix}" if flow_suffix else ""),
+                    f"Turnover: ₹{turnover:.2f} Cr",
+                    f"Lots: {confirmed_lots} (Qty: {qty})",
+                    f"Price: {price:.2f}",
+                    f"{underlying_label}: {underlying_price:.1f}",
+                ]
+                if state.underlying_name == "CRUDEOIL":
+                    print(
+                        f"DEBUG CRUDEOIL alert symbol={state.symbol} flow={flow_label} "
+                        f"confirmed_lots={confirmed_lots} qty={qty} turnover={turnover:.2f}"
+                    )
+                send_future_scanner_alert("\n".join(lines))
 
-        flow_label, flow_suffix = self._classify_flow(delta_price, delta_oi)
-        delta_oi_lots = abs(delta_oi) / state.lot_size
-        turnover = self._turnover_cr(flow_label, delta_qty, price, delta_oi_lots)
-        strike_label = self._strike_label(state, underlying_price, lots)
-        underlying_label = "Fut Price" if state.underlying_name == "CRUDEOIL" else "Spot Price"
+                state.last_alert_bucket = confirmed_lots // max(state.threshold_lots, 1)
+                state.last_alert_at = time.time()
+                self.pending_confirmations.pop(token, None)
 
-        lines = [
-            f"{state.symbol} ({strike_label})",
-            f"⚡ {flow_label}" + (f" {flow_suffix}" if flow_suffix else ""),
-            f"Turnover: ₹{turnover:.2f} Cr",
-            f"Lots: {lots} (Qty: {int(delta_qty)})",
-            f"Price: {price:.2f}",
-            f"{underlying_label}: {underlying_price:.1f}",
-        ]
-        if state.underlying_name == "CRUDEOIL":
+        delta_qty_from_last = max(total_volume - float(prev_volume), 0.0)
+        below_threshold_lots = int(delta_qty_from_last / state.lot_size)
+        if state.underlying_name == "CRUDEOIL" and debug_count < 12 and tick_lots < state.threshold_lots:
             print(
-                f"DEBUG CRUDEOIL alert symbol={state.symbol} flow={flow_label} "
-                f"lots={lots} qty={int(delta_qty)} oi_lots={delta_oi_lots:.2f} turnover={turnover:.2f}"
+                f"DEBUG CRUDEOIL below threshold symbol={state.symbol} "
+                f"tick_lots={tick_lots} qty={int(delta_qty_from_last)} threshold={state.threshold_lots}"
             )
-        send_future_scanner_alert("\n".join(lines))
+            self.debug_counts[debug_key] = debug_count + 1
 
-        state.last_alert_bucket = alert_bucket
-        state.last_alert_at = now
         state.last_price = price
         state.last_oi = total_oi
+        state.last_volume = total_volume
