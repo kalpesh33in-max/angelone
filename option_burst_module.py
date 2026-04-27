@@ -29,7 +29,7 @@ UNDERLYING_CONFIG = {
         "option_exchange_type": 4,
     },
     "CRUDEOIL": {
-        "threshold_lots": 5,
+        "threshold_lots": 25,
         "option_exchange_type": 5,
     },
 }
