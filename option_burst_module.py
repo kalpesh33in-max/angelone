@@ -65,6 +65,7 @@ class OptionBurstModule:
         self.last_refresh_at = 0.0
         self.startup_alert_sent = False
         self._refresh_lock = threading.Lock()
+        self.debug_counts = {}
 
     def start(self):
         self.engine.register(self)
@@ -109,6 +110,10 @@ class OptionBurstModule:
         self.contract_states = next_states
         self.last_refresh_at = now
         print(f"Option flow scanner active with {len(self.contract_states)} option contracts.")
+        summary = {}
+        for state in self.contract_states.values():
+            summary[state.underlying_name] = summary.get(state.underlying_name, 0) + 1
+        print(f"Option flow watchlist summary: {summary}")
 
     def _refresh_underlying(self, underlying_name, config, next_states):
         underlying = resolve_underlying_instrument(underlying_name)
@@ -163,6 +168,18 @@ class OptionBurstModule:
                     state.strike_step = strike_step
                     state.threshold_lots = int(config["threshold_lots"])
                 next_states[token] = state
+
+        selected_symbols = [
+            state.symbol
+            for state in next_states.values()
+            if state.underlying_name == underlying_name
+        ]
+        print(
+            f"{underlying_name} underlying={underlying_price:.2f} "
+            f"selected_contracts={len(selected_symbols)}"
+        )
+        if selected_symbols:
+            print(f"{underlying_name} sample contracts: {selected_symbols[:8]}")
 
     def _get_underlying_price(self, underlying):
         token = underlying["token"]
@@ -267,7 +284,16 @@ class OptionBurstModule:
     def on_tick(self, token, tick):
         token = str(token)
         if token in self.underlying_tokens:
-            self.underlying_prices[self.underlying_tokens[token]] = float(tick["ltp"])
+            underlying_name = self.underlying_tokens[token]
+            self.underlying_prices[underlying_name] = float(tick["ltp"])
+            if underlying_name == "CRUDEOIL":
+                count = self.debug_counts.get(f"underlying:{token}", 0)
+                if count < 5:
+                    print(
+                        f"DEBUG CRUDEOIL underlying tick token={token} "
+                        f"ltp={tick['ltp']} raw_keys={sorted((tick.get('raw') or {}).keys())}"
+                    )
+                    self.debug_counts[f"underlying:{token}"] = count + 1
             return
 
         state = self.contract_states.get(token)
@@ -285,6 +311,15 @@ class OptionBurstModule:
         raw_tick = tick.get("raw", {})
         total_volume = self._extract_total_volume(raw_tick)
         total_oi = self._extract_open_interest(raw_tick)
+        debug_key = f"contract:{token}"
+        debug_count = self.debug_counts.get(debug_key, 0)
+        if state.underlying_name == "CRUDEOIL" and debug_count < 8:
+            print(
+                f"DEBUG CRUDEOIL option tick symbol={state.symbol} token={token} "
+                f"price={price} volume={total_volume} oi={total_oi} "
+                f"raw_keys={sorted(raw_tick.keys())}"
+            )
+            self.debug_counts[debug_key] = debug_count + 1
         if total_volume is None or total_oi is None:
             return
 
@@ -299,6 +334,12 @@ class OptionBurstModule:
         delta_qty = max(total_volume - state.baseline_volume, 0.0)
         lots = math.floor(delta_qty / state.lot_size)
         if lots < state.threshold_lots:
+            if state.underlying_name == "CRUDEOIL" and debug_count < 12:
+                print(
+                    f"DEBUG CRUDEOIL below threshold symbol={state.symbol} "
+                    f"lots={lots} qty={int(delta_qty)} threshold={state.threshold_lots}"
+                )
+                self.debug_counts[debug_key] = debug_count + 1
             state.last_price = price
             state.last_oi = total_oi
             return
@@ -333,6 +374,11 @@ class OptionBurstModule:
             f"Price: {price:.2f}",
             f"{underlying_label}: {underlying_price:.1f}",
         ]
+        if state.underlying_name == "CRUDEOIL":
+            print(
+                f"DEBUG CRUDEOIL alert symbol={state.symbol} flow={flow_label} "
+                f"lots={lots} qty={int(delta_qty)} oi_lots={delta_oi_lots:.2f} turnover={turnover:.2f}"
+            )
         send_future_scanner_alert("\n".join(lines))
 
         state.last_alert_bucket = alert_bucket
