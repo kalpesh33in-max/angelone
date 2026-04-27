@@ -14,7 +14,7 @@ from telegram_utils import send_future_scanner_alert
 
 IST = ZoneInfo("Asia/Kolkata")
 REFRESH_SECONDS = 60
-ALERT_COOLDOWN_SECONDS = 30
+ALERT_COOLDOWN_SECONDS = 15
 ATM_STRIKE_RANGE = 10
 HIGH_LOTS_MULTIPLIER = 2
 ROLLING_WINDOW_SECONDS = 120
@@ -29,7 +29,7 @@ UNDERLYING_CONFIG = {
         "option_exchange_type": 4,
     },
     "CRUDEOIL": {
-        "threshold_lots": 25,
+        "threshold_lots": 5,
         "option_exchange_type": 5,
     },
 }
