@@ -21,15 +21,15 @@ ROLLING_WINDOW_SECONDS = 120
 
 UNDERLYING_CONFIG = {
     "NIFTY": {
-        "threshold_lots": 500,
+        "threshold_lots": 250,
         "option_exchange_type": 2,
     },
     "SENSEX": {
-        "threshold_lots": 500,
+        "threshold_lots": 250,
         "option_exchange_type": 4,
     },
     "CRUDEOIL": {
-        "threshold_lots": 50,
+        "threshold_lots": 25,
         "option_exchange_type": 5,
     },
 }
@@ -268,7 +268,9 @@ class OptionBurstModule:
 
     def _is_in_scope(self, state, underlying_price):
         diff = underlying_price - state.strike if state.option_type == "CE" else state.strike - underlying_price
-        return abs(diff) <= (ATM_STRIKE_RANGE * state.strike_step) + 1e-6
+        max_depth = (ATM_STRIKE_RANGE * state.strike_step) + 1e-6
+        one_strike_exception = state.strike_step + 1e-6
+        return (-one_strike_exception) <= diff <= max_depth
 
     def _classify_flow(self, delta_price, delta_oi):
         if delta_price >= 0 and delta_oi >= 0:
