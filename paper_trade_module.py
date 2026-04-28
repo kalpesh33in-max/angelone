@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -64,6 +65,13 @@ class PaperTradeModule:
         self._start_telegram_listener()
 
     def _start_telegram_listener(self):
+        print(
+            "Paper trade Telegram config status: "
+            f"TG_API_ID={'set' if TG_API_ID else 'missing'}, "
+            f"TG_API_HASH={'set' if TG_API_HASH else 'missing'}, "
+            f"TG_SESSION_STR={'set' if TG_SESSION_STR else 'missing'}, "
+            f"SOURCE_CHAT={SOURCE_CHAT!r}"
+        )
         if not (TG_API_ID and TG_API_HASH and TG_SESSION_STR):
             print("Paper trade Telegram listener disabled: missing TG_API_ID/TG_API_HASH/TG_SESSION_STR")
             return
@@ -72,40 +80,89 @@ class PaperTradeModule:
         threading.Thread(target=self._telegram_thread_main, daemon=True).start()
 
     def _telegram_thread_main(self):
-        asyncio.run(self._telegram_main())
+        print("Paper trade Telegram listener thread started.")
+        try:
+            asyncio.run(self._telegram_main())
+        except Exception as exc:
+            print(f"Paper trade Telegram listener crashed: {exc}")
+            traceback.print_exc()
 
     async def _telegram_main(self):
+        print("Paper trade Telegram client initializing...")
         self.client = TelegramClient(StringSession(TG_SESSION_STR), int(TG_API_ID), TG_API_HASH)
         await self.client.start()
+        me = await self.client.get_me()
+        print(
+            "Paper trade Telegram client authenticated: "
+            f"id={getattr(me, 'id', '')} "
+            f"username={getattr(me, 'username', '')!r} "
+            f"phone={getattr(me, 'phone', '')!r}"
+        )
         print(f"Paper trade listener active for source chat: {SOURCE_CHAT}")
 
         @self.client.on(events.NewMessage())
         async def handler(event):
             chat = await event.get_chat()
             text = event.raw_text or ""
-            if not self._source_match(event, chat):
+            chat_debug = self._describe_chat(event, chat)
+            compact_text = " ".join(text.split())
+            if len(compact_text) > 160:
+                compact_text = compact_text[:157] + "..."
+            print(f"Paper trade Telegram message received from {chat_debug}: {compact_text}")
+
+            source_ok = self._source_match(event, chat)
+            if not source_ok:
+                print(
+                    "Paper trade Telegram message ignored: "
+                    f"source mismatch. Expected SOURCE_CHAT={SOURCE_CHAT!r}"
+                )
                 return
 
             parsed = self.parse_dual_match(text)
             if not parsed:
+                print("Paper trade Telegram message ignored: dual-match pattern not found.")
                 return
 
             strike, option_type = parsed
-            result = self.process_signal(strike, option_type)
+            print(f"Paper trade Telegram message parsed: strike={strike} option_type={option_type}")
+
+            try:
+                result = self.process_signal(strike, option_type)
+            except Exception as exc:
+                print(
+                    f"Paper trade signal processing failed for "
+                    f"BANKNIFTY {strike} {option_type}: {exc}"
+                )
+                return
+
             if not result:
+                print("Paper trade signal produced no new action.")
                 return
 
             if result[0] == "REV":
                 _, old_trade, exit_price, new_trade = result
+                print(
+                    f"Paper trade reversed: exited {old_trade.strike} {old_trade.option_type} "
+                    f"and entered {new_trade.strike} {new_trade.option_type}"
+                )
                 send_paper_trade_alert(
                     f"\U0001f501 EXIT BANKNIFTY {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}"
                 )
                 send_paper_trade_alert(self.format_trade(new_trade))
             elif result[0] == "NEW":
                 _, trade = result
+                print(f"Paper trade alerting new trade: BANKNIFTY {trade.strike} {trade.option_type}")
                 send_paper_trade_alert(self.format_trade(trade))
 
         await self.client.run_until_disconnected()
+
+    def _describe_chat(self, event, chat):
+        return {
+            "event_chat_id": str(getattr(event, "chat_id", "")),
+            "title": str(getattr(chat, "title", "") or ""),
+            "username": str(getattr(chat, "username", "") or ""),
+            "first_name": str(getattr(chat, "first_name", "") or ""),
+        }
 
     def _source_match(self, event, chat):
         source_value = str(SOURCE_CHAT).strip().lower()
@@ -113,6 +170,10 @@ class PaperTradeModule:
         for value in (getattr(chat, "title", None), getattr(chat, "username", None), getattr(chat, "first_name", None)):
             if value:
                 candidates.append(str(value).strip().lower())
+        print(
+            "Paper trade source check: "
+            f"expected={source_value!r} candidates={candidates}"
+        )
         return source_value in candidates
 
     def parse_dual_match(self, text):
