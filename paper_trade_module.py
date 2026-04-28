@@ -165,16 +165,20 @@ class PaperTradeModule:
         }
 
     def _source_match(self, event, chat):
-        source_value = str(SOURCE_CHAT).strip().lower()
+        source_values = [
+            value.strip().lower()
+            for value in str(SOURCE_CHAT).split(",")
+            if value.strip()
+        ]
         candidates = [str(getattr(event, "chat_id", "")).lower()]
         for value in (getattr(chat, "title", None), getattr(chat, "username", None), getattr(chat, "first_name", None)):
             if value:
                 candidates.append(str(value).strip().lower())
         print(
             "Paper trade source check: "
-            f"expected={source_value!r} candidates={candidates}"
+            f"expected={source_values!r} candidates={candidates}"
         )
-        return source_value in candidates
+        return any(source_value in candidates for source_value in source_values)
 
     def parse_dual_match(self, text):
         text_upper = text.upper()
