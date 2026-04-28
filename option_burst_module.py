@@ -1,9 +1,7 @@
-import math
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from collections import deque
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -17,7 +15,6 @@ REFRESH_SECONDS = 60
 ALERT_COOLDOWN_SECONDS = 15
 ATM_STRIKE_RANGE = 10
 HIGH_LOTS_MULTIPLIER = 2
-ROLLING_WINDOW_SECONDS = 120
 
 UNDERLYING_CONFIG = {
     "NIFTY": {
@@ -29,7 +26,7 @@ UNDERLYING_CONFIG = {
         "option_exchange_type": 4,
     },
     "CRUDEOIL": {
-        "threshold_lots": 25,
+        "threshold_lots": 50,
         "option_exchange_type": 5,
     },
 }
@@ -52,7 +49,6 @@ class ContractState:
     last_price: float | None = None
     last_oi: float | None = None
     last_volume: float | None = None
-    history: deque | None = None
     last_alert_bucket: int = 0
     last_alert_at: float = 0.0
 
@@ -77,13 +73,7 @@ class OptionBurstModule:
         self.engine.register(self)
         print("Option flow module registered on shared market-data engine.")
         if not self.startup_alert_sent:
-            send_future_scanner_alert(
-                "Option Flow Scanner Started\n"
-                "Tracking NIFTY/SENSEX above 500 lots and CRUDEOIL above 250 lots\n"
-                "Expiries: NEAR, NEXT, MONTH\n"
-                "Strikes: ATM plus/minus 10 only\n"
-                "Alerts: ACTION / WRITER / SHORT COVERING / UNWINDING"
-            )
+            send_future_scanner_alert("Option Flow Scanner Started")
             self.startup_alert_sent = True
         self.start_background_setup()
 
@@ -165,7 +155,6 @@ class OptionBurstModule:
                         lot_size=max(int(row["lotsize"]), 1),
                         strike_step=strike_step,
                         threshold_lots=int(config["threshold_lots"]),
-                        history=deque(),
                     )
                 else:
                     state.expiry_bucket = str(expiry_bucket)
@@ -174,8 +163,6 @@ class OptionBurstModule:
                     state.lot_size = max(int(row["lotsize"]), 1)
                     state.strike_step = strike_step
                     state.threshold_lots = int(config["threshold_lots"])
-                    if state.history is None:
-                        state.history = deque()
                 next_states[token] = state
 
         selected_symbols = [
@@ -342,57 +329,26 @@ class OptionBurstModule:
             state.last_price = price
             state.last_oi = total_oi
             state.last_volume = total_volume
-            if state.history is None:
-                state.history = deque()
-            state.history.append(
-                {
-                    "time": now_dt,
-                    "oi": float(total_oi),
-                    "price": float(price),
-                    "volume": float(total_volume),
-                }
-            )
             return
 
         prev_oi = state.last_oi if state.last_oi is not None else state.baseline_oi
         prev_price = state.last_price if state.last_price is not None else state.baseline_price
         prev_volume = state.last_volume if state.last_volume is not None else state.baseline_volume
-
-        if state.history is None:
-            state.history = deque()
-        state.history.append(
-            {
-                "time": now_dt,
-                "oi": float(total_oi),
-                "price": float(price),
-                "volume": float(total_volume),
-            }
-        )
-        while state.history and (now_dt - state.history[0]["time"]).total_seconds() > ROLLING_WINDOW_SECONDS:
-            state.history.popleft()
-
-        rolling_base = state.history[0] if state.history else {
-            "oi": float(prev_oi),
-            "price": float(prev_price),
-            "volume": float(prev_volume),
-        }
-
         tick_oi_change = total_oi - float(prev_oi)
-        rolling_oi_change = total_oi - float(rolling_base["oi"])
-        tick_lots = int(abs(rolling_oi_change) / state.lot_size)
+        tick_lots = int(abs(tick_oi_change) / state.lot_size)
         pending = self.pending_confirmations.get(token)
 
         if pending is None and tick_lots >= state.threshold_lots:
             self.pending_confirmations[token] = {
                 "time": now_dt,
-                "baseline_oi": float(rolling_base["oi"]),
-                "baseline_price": float(rolling_base["price"]),
-                "baseline_volume": float(rolling_base["volume"]),
+                "baseline_oi": float(prev_oi),
+                "baseline_price": float(prev_price),
+                "baseline_volume": float(prev_volume),
             }
             if state.underlying_name == "CRUDEOIL":
                 print(
                     f"DEBUG CRUDEOIL pending created symbol={state.symbol} "
-                    f"rolling_lots={tick_lots} threshold={state.threshold_lots}"
+                    f"tick_lots={tick_lots} threshold={state.threshold_lots}"
                 )
         elif pending is not None:
             confirmed_oi_change = total_oi - float(pending["baseline_oi"])
@@ -437,7 +393,7 @@ class OptionBurstModule:
         if state.underlying_name == "CRUDEOIL" and debug_count < 12 and tick_lots < state.threshold_lots:
             print(
                 f"DEBUG CRUDEOIL below threshold symbol={state.symbol} "
-                f"rolling_lots={tick_lots} qty={int(delta_qty_from_last)} threshold={state.threshold_lots}"
+                f"tick_lots={tick_lots} qty={int(delta_qty_from_last)} threshold={state.threshold_lots}"
             )
             self.debug_counts[debug_key] = debug_count + 1
 
