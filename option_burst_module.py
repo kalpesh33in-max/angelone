@@ -11,20 +11,21 @@ from telegram_utils import send_future_scanner_alert
 
 
 IST = ZoneInfo("Asia/Kolkata")
+
 REFRESH_SECONDS = 60
 ATM_STRIKE_RANGE = 50
+CONFIRMATION_TIME = 15
 
-# 🔥 FINAL SETTINGS
 OPTION_MIN_LOTS = 200
-FUTURE_MIN_LOTS = 50   # 🔥 UPDATED
+FUTURE_MIN_LOTS = 200
 
-# 🔥 FIXED EXPIRY MAP
+# 🔥 FIXED MONTHLY EXPIRY
 EXPIRY_MAP = {
     "NIFTY": "2026-05-26",
     "BANKNIFTY": "2026-05-26",
     "FINNIFTY": "2026-05-26",
     "MIDCPNIFTY": "2026-05-26",
-    "SENSEX": "2026-05-27",  # 🔥 ONLY SENSEX DIFFERENT
+    "SENSEX": "2026-05-27",
 }
 
 UNDERLYING_CONFIG = {
@@ -54,10 +55,11 @@ class OptionBurstModule:
         self.contract_states = {}
         self.underlying_tokens = {}
         self.underlying_prices = {}
+        self.pending_confirmations = {}
 
     def start(self):
         self.engine.register(self)
-        print("🔥 FINAL FIXED EXPIRY SCANNER STARTED", flush=True)
+        print("🔥 FINAL SCANNER STARTED", flush=True)
         threading.Thread(target=self._setup, daemon=True).start()
 
     def _setup(self):
@@ -81,44 +83,39 @@ class OptionBurstModule:
                 self.underlying_tokens[token] = name
                 self.engine.subscribe_tokens(underlying["exchange_type"], [token])
 
-                spot_price = self.engine.get_latest_price(token)
-                if not spot_price:
+                spot = self.engine.get_latest_price(token)
+                if not spot:
                     continue
 
-                self.underlying_prices[name] = spot_price
+                self.underlying_prices[name] = spot
 
                 df = load_option_contracts(name, expiry_count=6)
                 if df.empty:
                     continue
 
-                # 🔥 FIXED EXPIRY FILTER
-                target_expiry = pd.to_datetime(EXPIRY_MAP[name]).date()
                 df["expiry_dt"] = pd.to_datetime(df["expiry_dt"]).dt.date
+                target = pd.to_datetime(EXPIRY_MAP[name]).date()
 
-                monthly_df = df[df["expiry_dt"] == target_expiry]
-
+                monthly_df = df[df["expiry_dt"] == target]
                 if monthly_df.empty:
-                    print(f"[WARN] No contracts for {name}", flush=True)
+                    print(f"[WARN] {name} no contracts", flush=True)
                     continue
 
-                # 🔥 ATM FILTER
-                filtered_df = monthly_df[
-                    abs(monthly_df["strike_value"] - spot_price) <= ATM_STRIKE_RANGE
+                filtered = monthly_df[
+                    abs(monthly_df["strike_value"] - spot) <= ATM_STRIKE_RANGE
                 ]
 
-                if filtered_df.empty:
+                if filtered.empty:
                     continue
 
                 self.engine.subscribe_tokens(
                     UNDERLYING_CONFIG[name]["option_exchange_type"],
-                    filtered_df["token"].astype(str).tolist()
+                    filtered["token"].astype(str).tolist()
                 )
 
-                for _, row in filtered_df.iterrows():
-                    token = str(row["token"])
-
-                    new_states[token] = ContractState(
-                        token=token,
+                for _, row in filtered.iterrows():
+                    new_states[str(row["token"])] = ContractState(
+                        token=str(row["token"]),
                         symbol=row["symbol"],
                         underlying_name=name,
                         strike=float(row["strike_value"]),
@@ -134,8 +131,9 @@ class OptionBurstModule:
 
     def on_tick(self, token, tick):
         token = str(token)
+        now = time.time()
 
-        # 🚀 FUTURE ALERT
+        # ================= FUTURE =================
         if token in self.underlying_tokens:
             name = self.underlying_tokens[token]
             price = float(tick["ltp"])
@@ -144,40 +142,58 @@ class OptionBurstModule:
             change = price - prev
             self.underlying_prices[name] = price
 
-            est_lots = abs(change) * 60
+            lots = abs(change) * 60
+            key = f"FUT_{name}"
 
-            if est_lots >= FUTURE_MIN_LOTS:
-                is_up = change > 0
-                arrow = "▲" if is_up else "▼"
-                signal = "BUY (LONG)" if is_up else "SELL (SHORT)"
+            if lots >= FUTURE_MIN_LOTS:
+                p = self.pending_confirmations.get(key)
 
-                oi_change = int(est_lots * 500)
-                existing_oi = int(oi_change * 50)
-                new_oi = existing_oi + oi_change
+                if not p:
+                    self.pending_confirmations[key] = {
+                        "start": now,
+                        "lots": lots,
+                        "price": price,
+                        "change": change
+                    }
+                    return
 
-                current_time = datetime.now().strftime("%H:%M:%S")
+                if now - p["start"] < CONFIRMATION_TIME:
+                    if lots < FUTURE_MIN_LOTS:
+                        self.pending_confirmations.pop(key, None)
+                    else:
+                        p["lots"] = lots
+                        p["price"] = price
+                    return
 
-                message = (
-                    f"🚀 BLAST 🚀\n"
-                    f"🚨 FUTURE {signal} 📈\n"
-                    f"Symbol: NFO:{name}\n"
-                    f"-------------------------\n"
-                    f"LOTS: {int(est_lots)}\n"
-                    f"PRICE: {price:.2f} ({arrow})\n"
-                    f"FUTURE PRICE: {price:.2f}\n"
-                    f"-------------------------\n"
-                    f"EXISTING OI: {existing_oi:,}\n"
-                    f"OI CHANGE : +{oi_change:,}\n"
-                    f"NEW OI    : {new_oi:,}\n"
-                    f"TIME: {current_time}"
-                )
+                if lots >= p["lots"]:
 
-                print(f"[FUTURE ALERT] {name}", flush=True)
-                send_future_scanner_alert(message)
+                    # 🔥 FUTURE TURNOVER (YOUR RULE)
+                    turnover = lots * 100000
+
+                    # 🔥 CLASSIFICATION
+                    if change >= 0:
+                        label = "ACTION"
+                        suffix = ""
+                    else:
+                        label = "WRITER"
+                        suffix = " ✍️"
+
+                    msg = (
+                        f"{name} FUT\n\n"
+                        f"⚡ {label}{suffix}\n"
+                        f"Turnover: ₹{turnover/1e7:.2f} Cr\n"
+                        f"Lots: {int(lots)}\n"
+                        f"Price: {price:.2f}\n"
+                        f"Spot Price: {price:.2f}"
+                    )
+
+                    send_future_scanner_alert(msg)
+
+                self.pending_confirmations.pop(key, None)
 
             return
 
-        # ⚡ OPTION ALERT (UNCHANGED FORMAT)
+        # ================= OPTION =================
         state = self.contract_states.get(token)
         if not state:
             return
@@ -199,31 +215,48 @@ class OptionBurstModule:
         delta_oi = oi - state.last_oi
         lots = abs(delta_oi) / state.lot_size
 
-        if lots < OPTION_MIN_LOTS:
-            state.last_oi = oi
-            return
+        key = f"OPT_{token}"
 
-        price_change = price - state.last_price
+        if lots >= OPTION_MIN_LOTS:
+            p = self.pending_confirmations.get(key)
 
-        if price_change >= 0 and delta_oi >= 0:
-            label = "ACTION"
-            suffix = ""
-        elif price_change < 0 and delta_oi >= 0:
-            label = "WRITER"
-            suffix = " ✍️"
-        elif price_change >= 0 and delta_oi < 0:
-            label = "SHORT COVERING"
-            suffix = " ↗️"
-        else:
-            label = "UNWINDING"
-            suffix = " ⤵️"
+            if not p:
+                self.pending_confirmations[key] = {
+                    "start": now,
+                    "lots": lots,
+                    "price": price,
+                    "doi": delta_oi
+                }
+                return
 
-        send_future_scanner_alert(
-            f"{state.symbol}\n\n"
-            f"⚡ {label}{suffix}\n"
-            f"Lots: {int(lots)}\n"
-            f"Price: {price:.2f}"
-        )
+            if now - p["start"] < CONFIRMATION_TIME:
+                if lots < OPTION_MIN_LOTS:
+                    self.pending_confirmations.pop(key, None)
+                else:
+                    p["lots"] = lots
+                    p["price"] = price
+                return
+
+            if lots >= p["lots"]:
+                dp = price - state.last_price
+
+                if dp >= 0 and delta_oi >= 0:
+                    label, suffix = "ACTION", ""
+                elif dp < 0 and delta_oi >= 0:
+                    label, suffix = "WRITER", " ✍️"
+                elif dp >= 0 and delta_oi < 0:
+                    label, suffix = "SHORT COVERING", " ↗️"
+                else:
+                    label, suffix = "UNWINDING", " ⤵️"
+
+                send_future_scanner_alert(
+                    f"{state.symbol}\n\n"
+                    f"⚡ {label}{suffix}\n"
+                    f"Lots: {int(lots)}\n"
+                    f"Price: {price:.2f}"
+                )
+
+            self.pending_confirmations.pop(key, None)
 
         state.last_oi = oi
         state.last_price = price
