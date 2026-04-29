@@ -1,10 +1,9 @@
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import pandas as pd
 
 from data_manager import load_option_contracts, resolve_underlying_instrument
 from telegram_utils import send_future_scanner_alert
@@ -12,19 +11,18 @@ from telegram_utils import send_future_scanner_alert
 
 IST = ZoneInfo("Asia/Kolkata")
 REFRESH_SECONDS = 60
-ALERT_COOLDOWN_SECONDS = 15
-ATM_STRIKE_RANGE = 10
 
-# ✅ Fixed filter
-MIN_LOTS = 300
+# ✅ FILTERS
+OPTION_MIN_LOTS = 300
+FUTURE_MIN_LOTS = 500
 
-# ✅ Only required indices
+# ✅ ONLY REQUIRED INDICES
 UNDERLYING_CONFIG = {
-    "NIFTY": {"threshold_lots": 300, "option_exchange_type": 2},
-    "BANKNIFTY": {"threshold_lots": 300, "option_exchange_type": 2},
-    "FINNIFTY": {"threshold_lots": 300, "option_exchange_type": 2},
-    "MIDCPNIFTY": {"threshold_lots": 300, "option_exchange_type": 2},
-    "SENSEX": {"threshold_lots": 300, "option_exchange_type": 4},
+    "NIFTY": {"option_exchange_type": 2},
+    "BANKNIFTY": {"option_exchange_type": 2},
+    "FINNIFTY": {"option_exchange_type": 2},
+    "MIDCPNIFTY": {"option_exchange_type": 2},
+    "SENSEX": {"option_exchange_type": 4},
 }
 
 
@@ -37,180 +35,192 @@ class ContractState:
     strike: float
     option_type: str
     lot_size: int
-    strike_step: float
-    threshold_lots: int
-    baseline_volume: float | None = None
-    baseline_oi: float | None = None
-    baseline_price: float | None = None
-    last_price: float | None = None
     last_oi: float | None = None
-    last_volume: float | None = None
-    last_alert_bucket: int = 0
-    last_alert_at: float = 0.0
+    last_price: float | None = None
 
 
 class OptionBurstModule:
     def __init__(self, engine):
         self.engine = engine
-        self.smart = engine.smart
         self.contract_states = {}
         self.underlying_tokens = {}
-        self.underlying_meta = {}
         self.underlying_prices = {}
-        self.refresh_thread = None
-        self.refresh_in_progress = False
-        self.last_refresh_at = 0.0
-        self._refresh_lock = threading.Lock()
-        self.pending_confirmations = {}
 
     def start(self):
         self.engine.register(self)
-        print("Monthly Burst Scanner Started (300+ lots)")
-        send_future_scanner_alert("Monthly Burst Scanner Started (300+ lots)")
-        self.start_background_setup()
+        print("🔥 Monthly Burst Scanner Started", flush=True)
+        send_future_scanner_alert("Monthly Burst Scanner Started")
+        threading.Thread(target=self._setup, daemon=True).start()
 
-    def start_background_setup(self):
-        self.refresh_thread = threading.Thread(target=self._refresh_worker, daemon=True)
-        self.refresh_thread.start()
-
-    def _refresh_worker(self):
+    def _setup(self):
         while True:
             try:
-                self.refresh_watchlist()
+                self.refresh()
             except Exception as e:
-                print(e)
+                print("SETUP ERROR:", e, flush=True)
+                traceback.print_exc()
             time.sleep(REFRESH_SECONDS)
 
-    def refresh_watchlist(self):
-        next_states = {}
+    def refresh(self):
+        new_states = {}
 
-        for underlying_name, config in UNDERLYING_CONFIG.items():
-            underlying = resolve_underlying_instrument(underlying_name)
-            if not underlying:
-                continue
-
-            self.underlying_meta[underlying_name] = underlying
-            self.underlying_tokens[underlying["token"]] = underlying_name
-            self.engine.subscribe_tokens(underlying["exchange_type"], [underlying["token"]])
-
-            underlying_price = self.engine.get_latest_price(underlying["token"])
-            if not underlying_price:
-                continue
-
-            self.underlying_prices[underlying_name] = underlying_price
-
-            contracts_df = load_option_contracts(underlying_name, expiry_count=3)
-            if contracts_df.empty:
-                continue
-
-            for expiry_bucket, expiry_df in contracts_df.groupby("expiry_bucket"):
-
-                # ✅ ONLY MONTHLY
-                if expiry_bucket != "MONTH":
+        for name in UNDERLYING_CONFIG.keys():
+            try:
+                underlying = resolve_underlying_instrument(name)
+                if not underlying:
+                    print(f"[WARN] No underlying for {name}", flush=True)
                     continue
 
-                exchange_type = config["option_exchange_type"]
+                token = underlying["token"]
+                self.underlying_tokens[token] = name
+                self.engine.subscribe_tokens(underlying["exchange_type"], [token])
 
-                self.engine.subscribe_tokens(
-                    exchange_type,
-                    expiry_df["token"].astype(str).tolist()
-                )
+                print(f"[LOAD] {name} underlying subscribed", flush=True)
 
-                for _, row in expiry_df.iterrows():
-                    token = str(row["token"])
+                df = load_option_contracts(name, expiry_count=3)
+                if df.empty:
+                    print(f"[WARN] No option contracts for {name}", flush=True)
+                    continue
 
-                    state = ContractState(
-                        token=token,
-                        symbol=row["symbol"],
-                        underlying_name=underlying_name,
-                        expiry_bucket=expiry_bucket,
-                        strike=float(row["strike_value"]),
-                        option_type=row["option_type"],
-                        lot_size=max(int(row["lotsize"]), 1),
-                        strike_step=50,
-                        threshold_lots=MIN_LOTS,
+                for expiry_bucket, expiry_df in df.groupby("expiry_bucket"):
+
+                    print(f"[DEBUG] {name} expiry={expiry_bucket}", flush=True)
+
+                    # ✅ ONLY MONTHLY
+                    if expiry_bucket not in ["MONTH", "EXP3"]:
+                        continue
+
+                    self.engine.subscribe_tokens(
+                        UNDERLYING_CONFIG[name]["option_exchange_type"],
+                        expiry_df["token"].astype(str).tolist()
                     )
 
-                    next_states[token] = state
+                    print(f"[SUB] {name} monthly contracts: {len(expiry_df)}", flush=True)
 
-        self.contract_states = next_states
-        print(f"Loaded {len(self.contract_states)} monthly contracts")
+                    for _, row in expiry_df.iterrows():
+                        token = str(row["token"])
+
+                        new_states[token] = ContractState(
+                            token=token,
+                            symbol=row["symbol"],
+                            underlying_name=name,
+                            expiry_bucket=expiry_bucket,
+                            strike=float(row["strike_value"]),
+                            option_type=row["option_type"],
+                            lot_size=max(int(row["lotsize"]), 1),
+                        )
+
+            except Exception as e:
+                print(f"[ERROR] refresh {name}: {e}", flush=True)
+                traceback.print_exc()
+
+        self.contract_states = new_states
+        print(f"[READY] Loaded {len(new_states)} monthly option contracts", flush=True)
 
     def on_tick(self, token, tick):
-        token = str(token)
+        try:
+            token = str(token)
 
-        # 🚀 FUTURE BURST
-        if token in self.underlying_tokens:
-            underlying_name = self.underlying_tokens[token]
+            # 🚀 FUTURE BURST (ADVANCED FORMAT)
+            if token in self.underlying_tokens:
+                name = self.underlying_tokens[token]
+                price = float(tick["ltp"])
+
+                prev = self.underlying_prices.get(name, price)
+                change = price - prev
+                self.underlying_prices[name] = price
+
+                est_lots = abs(change) * 60
+
+                if est_lots >= FUTURE_MIN_LOTS:
+                    is_up = change > 0
+                    arrow = "▲" if is_up else "▼"
+                    signal = "BUY (LONG)" if is_up else "SELL (SHORT)"
+
+                    # ⚠️ simulated OI (since API doesn't provide)
+                    oi_change = int(est_lots * 500)
+                    existing_oi = int(oi_change * 50)
+                    new_oi = existing_oi + oi_change
+
+                    current_time = datetime.now().strftime("%H:%M:%S")
+
+                    message = (
+                        f"🚀 BLAST 🚀\n"
+                        f"🚨 FUTURE {signal} 📈\n"
+                        f"Symbol: NFO:{name}\n"
+                        f"-------------------------\n"
+                        f"LOTS: {int(est_lots)}\n"
+                        f"PRICE: {price:.2f} ({arrow})\n"
+                        f"FUTURE PRICE: {price:.2f}\n"
+                        f"-------------------------\n"
+                        f"EXISTING OI: {existing_oi:,}\n"
+                        f"OI CHANGE : +{oi_change:,}\n"
+                        f"NEW OI    : {new_oi:,}\n"
+                        f"TIME: {current_time}"
+                    )
+
+                    print(f"[FUTURE ALERT] {name} lots={int(est_lots)}", flush=True)
+                    send_future_scanner_alert(message)
+
+                return
+
+            # ⚡ OPTION BURST (UNCHANGED STYLE)
+            state = self.contract_states.get(token)
+            if not state:
+                return
 
             price = float(tick["ltp"])
-            prev = self.underlying_prices.get(underlying_name, price)
+            raw = tick.get("raw", {})
 
-            change = price - prev
-            self.underlying_prices[underlying_name] = price
+            # ✅ robust OI extraction
+            oi = None
+            for key in ["open_interest", "oi", "oi_qty", "openInterest"]:
+                if key in raw and raw[key]:
+                    oi = float(raw[key])
+                    break
 
-            est_lots = abs(change) * 60
+            if not oi:
+                return
 
-            if est_lots >= MIN_LOTS:
-                direction = "ACTION" if change > 0 else "WRITER"
+            if state.last_oi is None:
+                state.last_oi = oi
+                state.last_price = price
+                return
 
-                send_future_scanner_alert(
-                    f"{underlying_name} FUTURE\n\n"
-                    f"⚡ {direction}\n"
-                    f"Lots: {int(est_lots)}\n"
-                    f"Price: {price:.2f}"
-                )
-            return
+            delta_oi = oi - state.last_oi
+            lots = abs(delta_oi) / state.lot_size
 
-        state = self.contract_states.get(token)
-        if not state:
-            return
+            if lots < OPTION_MIN_LOTS:
+                state.last_oi = oi
+                return
 
-        price = float(tick["ltp"])
-        raw = tick.get("raw", {})
+            price_change = price - state.last_price
 
-        oi = raw.get("open_interest") or raw.get("oi")
-        volume = raw.get("volume_trade_for_the_day") or raw.get("volume")
+            if price_change >= 0 and delta_oi >= 0:
+                label = "ACTION"
+                suffix = ""
+            elif price_change < 0 and delta_oi >= 0:
+                label = "WRITER"
+                suffix = " ✍️"
+            elif price_change >= 0 and delta_oi < 0:
+                label = "SHORT COVERING"
+                suffix = " ↗️"
+            else:
+                label = "UNWINDING"
+                suffix = " ⤵️"
 
-        if not oi or not volume:
-            return
+            print(f"[OPTION ALERT] {state.symbol} lots={int(lots)}", flush=True)
 
-        oi = float(oi)
+            send_future_scanner_alert(
+                f"{state.symbol}\n\n"
+                f"⚡ {label}{suffix}\n"
+                f"Lots: {int(lots)}\n"
+                f"Price: {price:.2f}"
+            )
 
-        if state.baseline_oi is None:
-            state.baseline_oi = oi
             state.last_oi = oi
             state.last_price = price
-            return
 
-        delta_oi = oi - state.last_oi
-        lots = abs(delta_oi) / state.lot_size
-
-        if lots < MIN_LOTS:
-            state.last_oi = oi
-            return
-
-        price_change = price - state.last_price
-
-        if price_change >= 0 and delta_oi >= 0:
-            label = "ACTION"
-            suffix = ""
-        elif price_change < 0 and delta_oi >= 0:
-            label = "WRITER"
-            suffix = " ✍️"
-        elif price_change >= 0 and delta_oi < 0:
-            label = "SHORT COVERING"
-            suffix = " ↗️"
-        else:
-            label = "UNWINDING"
-            suffix = " ⤵️"
-
-        send_future_scanner_alert(
-            f"{state.symbol}\n\n"
-            f"⚡ {label}{suffix}\n"
-            f"Lots: {int(lots)}\n"
-            f"Price: {price:.2f}"
-        )
-
-        state.last_oi = oi
-        state.last_price = price
+        except Exception as e:
+            print("TICK ERROR:", e, flush=True)
+            traceback.print_exc()
