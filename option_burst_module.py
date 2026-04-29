@@ -16,7 +16,7 @@ ALERT_COOLDOWN_SECONDS = 15
 ATM_STRIKE_RANGE = 10
 HIGH_LOTS_MULTIPLIER = 2
 
-# ✅ UPDATED: ALL INDEX + SAME LOGIC
+# ✅ ALL INDEX
 UNDERLYING_CONFIG = {
     "NIFTY": {"threshold_lots": 200, "option_exchange_type": 2},
     "BANKNIFTY": {"threshold_lots": 200, "option_exchange_type": 2},
@@ -64,7 +64,7 @@ class OptionBurstModule:
 
     def start(self):
         self.engine.register(self)
-        print("Option Flow Scanner Started (Monthly Mode)", flush=True)
+        print("Option Flow Scanner Started (Monthly via FUTURE)", flush=True)
 
         if not self.startup_alert_sent:
             send_future_scanner_alert("Option Flow Scanner Started")
@@ -100,6 +100,7 @@ class OptionBurstModule:
         self.contract_states = next_states
         print(f"[READY] Loaded {len(self.contract_states)} contracts", flush=True)
 
+    # 🔥 MAIN FIX HERE
     def _refresh_underlying(self, underlying_name, config, next_states):
         underlying = resolve_underlying_instrument(underlying_name)
         if not underlying:
@@ -115,53 +116,56 @@ class OptionBurstModule:
 
         self.underlying_prices[underlying_name] = float(underlying_price)
 
-        df = load_option_contracts(underlying_name, expiry_count=6)
-        if df.empty:
+        contracts_df = load_option_contracts(underlying_name, expiry_count=6)
+        if contracts_df.empty:
             return
 
-        # 🔥 FIX: TRUE MONTHLY EXPIRY (NO WEEKLY)
-        df["expiry_dt"] = pd.to_datetime(df["expiry_dt"])
+        # ✅ FUTURE EXPIRY → OPTION EXPIRY MATCH
+        future_expiry = pd.to_datetime(underlying["expiry"])
 
-        monthly_expiries = (
-            df.groupby(df["expiry_dt"].dt.to_period("M"))["expiry_dt"]
-            .max()
-            .values
+        contracts_df["expiry_dt"] = pd.to_datetime(contracts_df["expiry_dt"])
+
+        monthly_df = contracts_df[
+            contracts_df["expiry_dt"] == future_expiry
+        ]
+
+        if monthly_df.empty:
+            print(f"[WARN] No monthly contracts for {underlying_name}", flush=True)
+            return
+
+        print(f"[INFO] {underlying_name} expiry used: {future_expiry.date()}", flush=True)
+
+        # ATM filter (UNCHANGED)
+        selected_df = self._select_atm_range_contracts(
+            monthly_df, underlying_price
         )
 
-        monthly_df = df[df["expiry_dt"].isin(monthly_expiries)]
+        if selected_df.empty:
+            return
 
-        for expiry_bucket, expiry_df in monthly_df.groupby("expiry_bucket"):
+        self.engine.subscribe_tokens(
+            config["option_exchange_type"],
+            selected_df["token"].tolist()
+        )
 
-            selected_df = self._select_atm_range_contracts(
-                expiry_df, underlying_price
+        strike_step = self._infer_strike_step(monthly_df)
+
+        for _, row in selected_df.iterrows():
+            token = str(row["token"])
+
+            state = ContractState(
+                token=token,
+                symbol=row["symbol"],
+                underlying_name=underlying_name,
+                expiry_bucket="MONTH",
+                strike=float(row["strike_value"]),
+                option_type=row["option_type"],
+                lot_size=max(int(row["lotsize"]), 1),
+                strike_step=strike_step,
+                threshold_lots=config["threshold_lots"],
             )
 
-            if selected_df.empty:
-                continue
-
-            self.engine.subscribe_tokens(
-                config["option_exchange_type"],
-                selected_df["token"].tolist()
-            )
-
-            strike_step = self._infer_strike_step(expiry_df)
-
-            for _, row in selected_df.iterrows():
-                token = str(row["token"])
-
-                state = ContractState(
-                    token=token,
-                    symbol=row["symbol"],
-                    underlying_name=underlying_name,
-                    expiry_bucket=str(expiry_bucket),
-                    strike=float(row["strike_value"]),
-                    option_type=row["option_type"],
-                    lot_size=max(int(row["lotsize"]), 1),
-                    strike_step=strike_step,
-                    threshold_lots=config["threshold_lots"],
-                )
-
-                next_states[token] = state
+            next_states[token] = state
 
     def _select_atm_range_contracts(self, expiry_df, underlying_price):
         strikes = sorted(expiry_df["strike_value"].unique())
@@ -214,6 +218,7 @@ class OptionBurstModule:
 
         raw = tick.get("raw", {})
         price = float(tick["ltp"])
+
         oi = self._extract_open_interest(raw)
         vol = self._extract_volume(raw)
 
@@ -236,6 +241,7 @@ class OptionBurstModule:
         dp = price - state.last_price
         label, suffix = self._classify_flow(dp, doi)
 
+        # 🔥 SAME FORMAT (UNCHANGED)
         msg = (
             f"{state.symbol}\n\n"
             f"⚡ {label} {suffix}\n"
