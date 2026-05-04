@@ -220,16 +220,6 @@ async def main() -> None:
         title = getattr(chat, "title", None)
         username = getattr(chat, "username", None)
         first_name = getattr(chat, "first_name", None)
-        print(
-            "New message:",
-            {
-                "chat_id": chat_id,
-                "title": title,
-                "username": username,
-                "first_name": first_name,
-                "text": text[:200],
-            },
-        )
 
         source_match = False
         source_value = str(SOURCE_CHAT).strip().lower()
@@ -241,8 +231,18 @@ async def main() -> None:
             source_match = True
 
         if not source_match:
-            print(f"Ignored message from non-source chat. Expected {SOURCE_CHAT}, got {candidates}")
             return
+
+        print(
+            "Source message:",
+            {
+                "chat_id": chat_id,
+                "title": title,
+                "username": username,
+                "first_name": first_name,
+                "text": text[:200],
+            },
+        )
 
         parsed = engine.parse_dual_match(text)
         if not parsed:
