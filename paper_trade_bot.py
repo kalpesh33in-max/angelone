@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -9,11 +10,16 @@ import pandas as pd
 import pyotp
 import pytz
 import requests
+from logzero import loglevel
 from SmartApi.smartConnect import SmartConnect
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# SmartAPI/logzero can print full request headers on failures, including
+# Authorization/API keys. Keep library logs silent and print sanitized errors.
+loglevel(logging.CRITICAL)
 
 STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
@@ -56,6 +62,10 @@ class Trade:
     last_price_alert: float = 0.0
 
 
+def safe_error(exc: Exception) -> str:
+    return type(exc).__name__
+
+
 class Engine:
     def __init__(self) -> None:
         self.smart = None
@@ -86,8 +96,11 @@ class Engine:
         return row.symbol, row.token
 
     def ltp(self, symbol: str, token: str) -> float:
-        data = self.smart.ltpData("NFO", symbol, token)
-        return float(data["data"]["ltp"])
+        try:
+            data = self.smart.ltpData("NFO", symbol, token)
+            return float(data["data"]["ltp"])
+        except Exception as exc:
+            raise RuntimeError(f"LTP fetch failed for {symbol}: {safe_error(exc)}") from None
 
     def parse_dual_match(self, text: str) -> tuple[int, str] | None:
         if "INSTITUTIONAL DUAL MATCH" not in text.upper():
@@ -186,21 +199,32 @@ def format_trade(trade: Trade) -> str:
 
 
 def send_output(text: str) -> None:
-    response = requests.post(
-        f"https://api.telegram.org/bot{OUTPUT_BOT_TOKEN}/sendMessage",
-        data={"chat_id": OUTPUT_CHAT_ID, "text": text},
-        timeout=30,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{OUTPUT_BOT_TOKEN}/sendMessage",
+            data={"chat_id": OUTPUT_CHAT_ID, "text": text},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Telegram send failed with HTTP {response.status_code}")
+    except Exception as exc:
+        raise RuntimeError(f"Telegram send failed: {safe_error(exc)}") from None
 
 
 async def monitor_loop() -> None:
     while True:
-        for message in engine.update():
+        try:
+            messages = engine.update()
+        except Exception as exc:
+            print(f"Monitor update failed: {safe_error(exc)}")
+            await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+            continue
+
+        for message in messages:
             try:
                 send_output(message)
             except Exception as exc:
-                print(f"Monitor send failed: {exc}")
+                print(f"Monitor send failed: {safe_error(exc)}")
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -240,7 +264,7 @@ async def main() -> None:
                 "title": title,
                 "username": username,
                 "first_name": first_name,
-                "text": text[:200],
+                "length": len(text),
             },
         )
 
@@ -251,7 +275,11 @@ async def main() -> None:
 
         strike, option_type = parsed
         print(f"Dual match detected: strike={strike}, option_type={option_type}")
-        result = engine.process_signal(strike, option_type)
+        try:
+            result = engine.process_signal(strike, option_type)
+        except Exception as exc:
+            print(f"Signal processing failed: {safe_error(exc)}")
+            return
 
         if not result:
             print("No action taken for signal.")
@@ -259,12 +287,20 @@ async def main() -> None:
 
         if result[0] == "REV":
             _, old_trade, exit_price, new_trade = result
-            send_output(f"\U0001f501 EXIT BANKNIFTY {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}")
-            send_output(format_trade(new_trade))
+            try:
+                send_output(f"\U0001f501 EXIT BANKNIFTY {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}")
+                send_output(format_trade(new_trade))
+            except Exception as exc:
+                print(f"Reversal send failed: {safe_error(exc)}")
+                return
             print("Reversal processed and output sent.")
         elif result[0] == "NEW":
             _, trade = result
-            send_output(format_trade(trade))
+            try:
+                send_output(format_trade(trade))
+            except Exception as exc:
+                print(f"New trade send failed: {safe_error(exc)}")
+                return
             print("New trade created and output sent.")
 
     await asyncio.gather(client.run_until_disconnected(), monitor_loop())
