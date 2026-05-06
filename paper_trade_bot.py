@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,6 +14,7 @@ import pytz
 import requests
 from logzero import loglevel
 from SmartApi.smartConnect import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -25,6 +28,8 @@ STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
 DUPLICATE_MINUTES = 10
 MONITOR_INTERVAL_SECONDS = 3
+USE_ANGEL_WS = str(env("USE_ANGEL_WS", "false")).lower() in ("true", "1", "yes")
+WS_MAX_AGE_SECONDS = float(env("WS_MAX_AGE_SECONDS", "5") or 5)
 
 SCRIP_MASTER_FILE = "OpenAPIScripMaster.json"
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -51,6 +56,7 @@ ANGEL_TOTP_SECRET = env("ANGEL_TOTP_SECRET")
 
 @dataclass
 class Trade:
+    underlying: str
     strike: int
     option_type: str
     symbol: str
@@ -65,6 +71,33 @@ class Trade:
 def safe_error(exc: Exception) -> str:
     return type(exc).__name__
 
+def safe_error_detail(exc: Exception) -> str:
+    """
+    Best-effort error details without leaking secrets into logs.
+    """
+    try:
+        detail = str(exc) or type(exc).__name__
+    except Exception:
+        return type(exc).__name__
+
+    secrets = [
+        TG_API_HASH,
+        TG_SESSION_STR,
+        OUTPUT_BOT_TOKEN,
+        str(OUTPUT_CHAT_ID) if OUTPUT_CHAT_ID else None,
+        ANGEL_API_KEY,
+        ANGEL_CLIENT_ID,
+        ANGEL_PASSWORD,
+        ANGEL_TOTP_SECRET,
+    ]
+    for secret in secrets:
+        if secret and secret in detail:
+            detail = detail.replace(secret, "***")
+
+    # Telegram bot token pattern: <digits>:<token>
+    detail = re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b", "***", detail)
+    return detail
+
 
 class Engine:
     def __init__(self) -> None:
@@ -72,11 +105,125 @@ class Engine:
         self.df = None
         self.trade: Trade | None = None
         self.last_signal: dict[str, datetime] = {}
+        self._ws: SmartWebSocketV2 | None = None
+        self._ws_thread: threading.Thread | None = None
+        self._ws_lock = threading.Lock()
+        self._ws_token: str | None = None
+        self._ws_ltp: dict[str, float] = {}
+        self._ws_ts: dict[str, float] = {}
 
     def login(self) -> None:
-        totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
-        self.smart = SmartConnect(api_key=ANGEL_API_KEY)
-        self.smart.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
+        try:
+            totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+            self.smart = SmartConnect(api_key=ANGEL_API_KEY)
+            self.smart.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
+        except Exception as exc:
+            raise RuntimeError(f"Angel login failed: {safe_error_detail(exc)}") from None
+
+    def _ensure_ws(self) -> None:
+        if not USE_ANGEL_WS:
+            return
+        if not self.smart:
+            return
+
+        with self._ws_lock:
+            if self._ws is not None and self._ws_thread is not None and self._ws_thread.is_alive():
+                return
+
+            auth_token = getattr(self.smart, "access_token", None)
+            feed_token = self.smart.getfeedToken()
+            client_code = getattr(self.smart, "userId", None) or ANGEL_CLIENT_ID
+            if not auth_token or not feed_token or not client_code:
+                raise RuntimeError("Angel WS init failed: missing auth/feed/client code")
+
+            self._ws = SmartWebSocketV2(
+                auth_token=auth_token,
+                api_key=ANGEL_API_KEY,
+                client_code=str(client_code),
+                feed_token=feed_token,
+            )
+
+            def _on_open(wsapp):
+                # Subscribe happens after _ws_token is set.
+                token = None
+                with self._ws_lock:
+                    token = self._ws_token
+                if not token:
+                    return
+                try:
+                    self._ws.subscribe(
+                        correlation_id="papertrade",
+                        mode=self._ws.LTP_MODE,
+                        token_list=[{"exchangeType": self._ws.NSE_FO, "tokens": [str(token)]}],
+                    )
+                except Exception as exc:
+                    print(f"Angel WS subscribe failed: {safe_error_detail(exc)}")
+
+            def _on_data(wsapp, data):
+                try:
+                    payload = data
+                    if isinstance(data, (bytes, bytearray)):
+                        import json
+
+                        payload = json.loads(data.decode("utf-8", errors="ignore"))
+                    if not isinstance(payload, dict):
+                        return
+
+                    token = str(payload.get("token") or payload.get("symbolToken") or payload.get("instrument_token") or "")
+                    if not token:
+                        return
+
+                    raw = payload.get("last_traded_price") or payload.get("ltp") or payload.get("LTP")
+                    if raw is None:
+                        return
+                    ltp = float(raw)
+                    # SmartAPI WS often uses paise; convert when needed.
+                    if ltp > 100000:
+                        ltp = ltp / 100.0
+
+                    now_ts = time.time()
+                    with self._ws_lock:
+                        self._ws_ltp[token] = ltp
+                        self._ws_ts[token] = now_ts
+                except Exception:
+                    return
+
+            def _on_error(wsapp, error):
+                print(f"Angel WS error: {safe_error_detail(Exception(str(error)))}")
+
+            def _on_close(wsapp):
+                print("Angel WS closed.")
+
+            self._ws.on_open = _on_open
+            self._ws.on_data = _on_data
+            self._ws.on_error = _on_error
+            self._ws.on_close = _on_close
+
+            self._ws_thread = threading.Thread(target=self._ws.connect, daemon=True)
+            self._ws_thread.start()
+
+    def _subscribe_ws_token(self, token: str) -> None:
+        if not USE_ANGEL_WS:
+            return
+        self._ensure_ws()
+        if not self._ws:
+            return
+
+        with self._ws_lock:
+            if self._ws_token == token:
+                return
+            self._ws_token = token
+
+        # If already connected, subscribe immediately (on_open also subscribes on reconnect).
+        try:
+            self._ws.subscribe(
+                correlation_id="papertrade",
+                mode=self._ws.LTP_MODE,
+                token_list=[{"exchangeType": self._ws.NSE_FO, "tokens": [str(token)]}],
+            )
+        except Exception:
+            # Not yet connected; on_open will subscribe.
+            pass
 
     def load(self) -> None:
         if not os.path.exists(SCRIP_MASTER_FILE):
@@ -86,31 +233,56 @@ class Engine:
                 fp.write(response.content)
 
         df = pd.read_json(SCRIP_MASTER_FILE)
-        df = df[(df.exch_seg == "NFO") & (df.name == "BANKNIFTY")].copy()
+        df = df[
+            (df.exch_seg == "NFO")
+            & (df.name.isin(["BANKNIFTY", "NIFTY", "MIDCPNIFTY", "HDFCBANK", "ICICIBANK"]))
+        ].copy()
         df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y")
         self.df = df[df.expiry >= datetime.now()].copy()
 
-    def resolve(self, strike: int, option_type: str) -> tuple[str, str]:
-        df = self.df[self.df.symbol.str.contains(f"{strike}{option_type}")]
+    def resolve(self, underlying: str, strike: int, option_type: str) -> tuple[str, str]:
+        df = self.df[
+            (self.df.name == underlying)
+            & (self.df.symbol.str.contains(f"{strike}{option_type}", regex=False))
+        ]
+        if df.empty:
+            raise RuntimeError(f"Scrip not found: {underlying} {strike} {option_type}")
         row = df.sort_values("expiry").iloc[0]
         return row.symbol, row.token
 
     def ltp(self, symbol: str, token: str) -> float:
+        if USE_ANGEL_WS:
+            now_ts = time.time()
+            with self._ws_lock:
+                ws_price = self._ws_ltp.get(str(token))
+                ws_time = self._ws_ts.get(str(token), 0.0)
+            if ws_price is not None and now_ts - ws_time <= WS_MAX_AGE_SECONDS:
+                return float(ws_price)
+
         try:
             data = self.smart.ltpData("NFO", symbol, token)
             return float(data["data"]["ltp"])
         except Exception as exc:
-            raise RuntimeError(f"LTP fetch failed for {symbol}: {safe_error(exc)}") from None
+            raise RuntimeError(f"LTP fetch failed for {symbol}: {safe_error_detail(exc)}") from None
 
-    def parse_dual_match(self, text: str) -> tuple[int, str] | None:
-        if "INSTITUTIONAL DUAL MATCH" not in text.upper():
+    def parse_dual_match(self, text: str) -> tuple[str, int, str] | None:
+        upper = text.upper()
+        if "INSTITUTIONAL DUAL MATCH" not in upper:
             return None
-        match = re.search(r"ACTION:\s*BUY\s+BANKNIFTY\s+(\d+)\s*(CE|PE)", text, re.IGNORECASE)
+        match = re.search(
+            r"ACTION:\s*BUY\s+(BANKNIFTY|NIFTY|MIDCPNIFTY|HDFCBANK|ICICIBANK)\s+(\d+)\s*(CE|PE)",
+            text,
+            re.IGNORECASE,
+        )
         if not match:
-            match = re.search(r"BANKNIFTY\s+(\d+)\s*(CE|PE)", text, re.IGNORECASE)
+            match = re.search(
+                r"(BANKNIFTY|NIFTY|MIDCPNIFTY|HDFCBANK|ICICIBANK)\s+(\d+)\s*(CE|PE)",
+                text,
+                re.IGNORECASE,
+            )
         if not match:
             return None
-        return int(match.group(1)), match.group(2).upper()
+        return match.group(1).upper(), int(match.group(2)), match.group(3).upper()
 
     def duplicate(self, key: str) -> bool:
         now = datetime.now(IST)
@@ -119,11 +291,13 @@ class Engine:
         self.last_signal[key] = now
         return False
 
-    def create_trade(self, strike: int, option_type: str) -> Trade:
-        symbol, token = self.resolve(strike, option_type)
+    def create_trade(self, underlying: str, strike: int, option_type: str) -> Trade:
+        symbol, token = self.resolve(underlying, strike, option_type)
+        self._subscribe_ws_token(token)
         price = self.ltp(symbol, token)
         targets = [price + STEP_POINTS * i for i in range(1, MAX_TARGET_LEVEL + 1)]
         return Trade(
+            underlying=underlying,
             strike=strike,
             option_type=option_type,
             symbol=symbol,
@@ -135,21 +309,21 @@ class Engine:
             last_price_alert=price,
         )
 
-    def process_signal(self, strike: int, option_type: str):
-        key = f"{strike}{option_type}"
+    def process_signal(self, underlying: str, strike: int, option_type: str):
+        key = f"{underlying}_{strike}{option_type}"
         if self.duplicate(key):
             return None, "DUP"
 
-        if self.trade and self.trade.option_type != option_type:
+        if self.trade and (self.trade.underlying != underlying or self.trade.option_type != option_type):
             exit_price = self.ltp(self.trade.symbol, self.trade.token)
             old_trade = self.trade
-            self.trade = self.create_trade(strike, option_type)
+            self.trade = self.create_trade(underlying, strike, option_type)
             return ("REV", old_trade, exit_price, self.trade)
 
         if self.trade:
             return None, "ACTIVE"
 
-        self.trade = self.create_trade(strike, option_type)
+        self.trade = self.create_trade(underlying, strike, option_type)
         return ("NEW", self.trade)
 
     def update(self) -> list[str]:
@@ -169,7 +343,7 @@ class Engine:
             trade.highest_target += 1
             trade.sl = trade.entry if trade.highest_target == 1 else trade.targets[trade.highest_target - 2]
             messages.append(
-                f"\U0001f3af BANKNIFTY {trade.strike} {trade.option_type} "
+                f"\U0001f3af {trade.underlying} {trade.strike} {trade.option_type} "
                 f"T{trade.highest_target} HIT @ {price:.2f}"
             )
 
@@ -186,7 +360,7 @@ engine = Engine()
 def format_trade(trade: Trade) -> str:
     return "\n".join(
         [
-            f"\U0001f525 BANKNIFTY {trade.strike} {trade.option_type}",
+            f"\U0001f525 {trade.underlying} {trade.strike} {trade.option_type}",
             "",
             f"\U0001f4cd Entry: {trade.entry:.2f}",
             f"\U0001f6e1\ufe0f SL: {trade.sl:.2f}",
@@ -216,7 +390,7 @@ async def monitor_loop() -> None:
         try:
             messages = engine.update()
         except Exception as exc:
-            print(f"Monitor update failed: {safe_error(exc)}")
+            print(f"Monitor update failed: {safe_error_detail(exc)}")
             await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
             continue
 
@@ -224,7 +398,7 @@ async def monitor_loop() -> None:
             try:
                 send_output(message)
             except Exception as exc:
-                print(f"Monitor send failed: {safe_error(exc)}")
+                print(f"Monitor send failed: {safe_error_detail(exc)}")
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -273,12 +447,12 @@ async def main() -> None:
             print("Source message received, but no dual-match pattern found.")
             return
 
-        strike, option_type = parsed
-        print(f"Dual match detected: strike={strike}, option_type={option_type}")
+        underlying, strike, option_type = parsed
+        print(f"Dual match detected: underlying={underlying}, strike={strike}, option_type={option_type}")
         try:
-            result = engine.process_signal(strike, option_type)
+            result = engine.process_signal(underlying, strike, option_type)
         except Exception as exc:
-            print(f"Signal processing failed: {safe_error(exc)}")
+            print(f"Signal processing failed: {safe_error_detail(exc)}")
             return
 
         if not result:
@@ -288,10 +462,12 @@ async def main() -> None:
         if result[0] == "REV":
             _, old_trade, exit_price, new_trade = result
             try:
-                send_output(f"\U0001f501 EXIT BANKNIFTY {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}")
+                send_output(
+                    f"\U0001f501 EXIT {old_trade.underlying} {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}"
+                )
                 send_output(format_trade(new_trade))
             except Exception as exc:
-                print(f"Reversal send failed: {safe_error(exc)}")
+                print(f"Reversal send failed: {safe_error_detail(exc)}")
                 return
             print("Reversal processed and output sent.")
         elif result[0] == "NEW":
@@ -299,7 +475,7 @@ async def main() -> None:
             try:
                 send_output(format_trade(trade))
             except Exception as exc:
-                print(f"New trade send failed: {safe_error(exc)}")
+                print(f"New trade send failed: {safe_error_detail(exc)}")
                 return
             print("New trade created and output sent.")
 

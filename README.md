@@ -8,22 +8,39 @@ This bot uses a Telegram user session to read `INSTITUTIONAL DUAL MATCH` alerts 
 - Output destination: your private channel like `bnf trade` via Bot API
 - Market data: Angel One option LTP
 
-## Accepted Source Message
+## Accepted Source Alerts
 
-```text
-INSTITUTIONAL DUAL MATCH
+This bot will open/monitor a paper trade only for `INSTITUTIONAL DUAL MATCH` alerts that include an `ACTION: BUY ...` line.
 
-ACTION: BUY BANKNIFTY 57200 PE
-SIGNAL: PUT (Matched in 10.0s)
-SL: 30 pts | TARGET: 60 pts
-```
-
-The parser only requires:
+Examples:
 
 ```text
 INSTITUTIONAL DUAL MATCH
 ACTION: BUY BANKNIFTY <strike> CE/PE
 ```
+
+```text
+INSTITUTIONAL DUAL MATCH
+ACTION: BUY NIFTY <strike> CE/PE
+```
+
+```text
+INSTITUTIONAL DUAL MATCH
+ACTION: BUY MIDCPNIFTY <strike> CE/PE
+```
+
+```text
+INSTITUTIONAL DUAL MATCH
+ACTION: BUY HDFCBANK <strike> CE/PE
+```
+
+```text
+INSTITUTIONAL DUAL MATCH
+ACTION: BUY ICICIBANK <strike> CE/PE
+```
+
+Notes:
+- `2 MIN OPTION FLOW ALERT` messages are treated as informational and are ignored by this bot (no `ACTION: BUY ...` line).
 
 ## Output Messages
 
