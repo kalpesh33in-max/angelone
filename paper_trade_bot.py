@@ -24,7 +24,7 @@ IST = pytz.timezone("Asia/Kolkata")
 # Authorization/API keys. Keep library logs silent and print sanitized errors.
 loglevel(logging.CRITICAL)
 
-STEP_POINTS = 30
+DEFAULT_STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
 DUPLICATE_MINUTES = 10
 MONITOR_INTERVAL_SECONDS = 3
@@ -66,6 +66,7 @@ class Trade:
     entry: float
     sl: float
     targets: list[float]
+    step_points: float
     highest_target: int = 0
     last_price_alert: float = 0.0
 
@@ -105,7 +106,7 @@ class Engine:
     def __init__(self) -> None:
         self.smart = None
         self.df = None
-        self.trade: Trade | None = None
+        self.trades: dict[str, Trade] = {}
         self.last_signal: dict[str, datetime] = {}
         self._ws: SmartWebSocketV2 | None = None
         self._ws_thread: threading.Thread | None = None
@@ -113,6 +114,12 @@ class Engine:
         self._ws_token: str | None = None
         self._ws_ltp: dict[str, float] = {}
         self._ws_ts: dict[str, float] = {}
+
+    def step_points_for(self, underlying: str) -> float:
+        # Stocks (and MIDCPNIFTY) use tighter paper-trade steps.
+        if underlying in {"HDFCBANK", "ICICIBANK", "RELIANCE", "MIDCPNIFTY"}:
+            return 10.0
+        return float(DEFAULT_STEP_POINTS)
 
     def login(self) -> None:
         try:
@@ -296,8 +303,9 @@ class Engine:
     def create_trade(self, underlying: str, strike: int, option_type: str) -> Trade:
         symbol, token = self.resolve(underlying, strike, option_type)
         self._subscribe_ws_token(token)
+        step_points = self.step_points_for(underlying)
         price = self.ltp(symbol, token)
-        targets = [price + STEP_POINTS * i for i in range(1, MAX_TARGET_LEVEL + 1)]
+        targets = [price + step_points * i for i in range(1, MAX_TARGET_LEVEL + 1)]
         return Trade(
             underlying=underlying,
             strike=strike,
@@ -305,8 +313,9 @@ class Engine:
             symbol=symbol,
             token=token,
             entry=price,
-            sl=price - STEP_POINTS,
+            sl=price - step_points,
             targets=targets,
+            step_points=step_points,
             highest_target=0,
             last_price_alert=price,
         )
@@ -316,42 +325,52 @@ class Engine:
         if self.duplicate(key):
             return None, "DUP"
 
-        if self.trade and (self.trade.underlying != underlying or self.trade.option_type != option_type):
-            exit_price = self.ltp(self.trade.symbol, self.trade.token)
-            old_trade = self.trade
-            self.trade = self.create_trade(underlying, strike, option_type)
-            return ("REV", old_trade, exit_price, self.trade)
+        active = self.trades.get(underlying)
 
-        if self.trade:
+        # Reverse only within the same underlying (BANKNIFTY vs NIFTY are independent).
+        if active and active.option_type != option_type:
+            exit_price = self.ltp(active.symbol, active.token)
+            old_trade = active
+            new_trade = self.create_trade(underlying, strike, option_type)
+            self.trades[underlying] = new_trade
+            return ("REV", old_trade, exit_price, new_trade)
+
+        if active:
             return None, "ACTIVE"
 
-        self.trade = self.create_trade(underlying, strike, option_type)
-        return ("NEW", self.trade)
+        new_trade = self.create_trade(underlying, strike, option_type)
+        self.trades[underlying] = new_trade
+        return ("NEW", new_trade)
 
     def update(self) -> list[str]:
-        if not self.trade:
+        if not self.trades:
             return []
 
-        trade = self.trade
-        price = self.ltp(trade.symbol, trade.token)
         messages: list[str] = []
+        to_delete: list[str] = []
 
-        if price <= trade.sl:
-            messages.append(f"\u274c SL HIT @ {price:.2f}")
-            self.trade = None
-            return messages
+        for underlying, trade in list(self.trades.items()):
+            price = self.ltp(trade.symbol, trade.token)
 
-        if trade.highest_target < MAX_TARGET_LEVEL and price >= trade.targets[trade.highest_target]:
-            trade.highest_target += 1
-            trade.sl = trade.entry if trade.highest_target == 1 else trade.targets[trade.highest_target - 2]
-            messages.append(
-                f"\U0001f3af {trade.underlying} {trade.strike} {trade.option_type} "
-                f"T{trade.highest_target} HIT @ {price:.2f}"
-            )
+            if price <= trade.sl:
+                messages.append(f"\u274c {underlying} SL HIT @ {price:.2f}")
+                to_delete.append(underlying)
+                continue
 
-        if price > trade.last_price_alert:
-            trade.last_price_alert = price
-            messages.append(f"\U0001f4c8 Price Update: {price:.2f}")
+            if trade.highest_target < MAX_TARGET_LEVEL and price >= trade.targets[trade.highest_target]:
+                trade.highest_target += 1
+                trade.sl = trade.entry if trade.highest_target == 1 else trade.targets[trade.highest_target - 2]
+                messages.append(
+                    f"\U0001f3af {trade.underlying} {trade.strike} {trade.option_type} "
+                    f"T{trade.highest_target} HIT @ {price:.2f}"
+                )
+
+            if price > trade.last_price_alert:
+                trade.last_price_alert = price
+                messages.append(f"\U0001f4c8 {underlying} Price Update: {price:.2f}")
+
+        for underlying in to_delete:
+            self.trades.pop(underlying, None)
 
         return messages
 
