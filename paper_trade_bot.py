@@ -28,8 +28,6 @@ STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
 DUPLICATE_MINUTES = 10
 MONITOR_INTERVAL_SECONDS = 3
-USE_ANGEL_WS = str(env("USE_ANGEL_WS", "false")).lower() in ("true", "1", "yes")
-WS_MAX_AGE_SECONDS = float(env("WS_MAX_AGE_SECONDS", "5") or 5)
 
 SCRIP_MASTER_FILE = "OpenAPIScripMaster.json"
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -37,6 +35,10 @@ SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files
 
 def env(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
+
+
+USE_ANGEL_WS = str(env("USE_ANGEL_WS", "false")).lower() in ("true", "1", "yes")
+WS_MAX_AGE_SECONDS = float(env("WS_MAX_AGE_SECONDS", "5") or 5)
 
 
 TG_API_ID = int(env("TG_API_ID"))
