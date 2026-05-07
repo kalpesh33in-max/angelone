@@ -31,12 +31,22 @@ ACTION: BUY MIDCPNIFTY <strike> CE/PE
 
 ```text
 INSTITUTIONAL DUAL MATCH
+ACTION: BUY SENSEX <strike> CE/PE
+```
+
+```text
+INSTITUTIONAL DUAL MATCH
 ACTION: BUY HDFCBANK <strike> CE/PE
 ```
 
 ```text
 INSTITUTIONAL DUAL MATCH
 ACTION: BUY ICICIBANK <strike> CE/PE
+```
+
+```text
+INSTITUTIONAL DUAL MATCH
+ACTION: BUY RELIANCE <strike> CE/PE
 ```
 
 Notes:
@@ -97,11 +107,13 @@ python paper_trade_bot.py
 ## Logic
 
 - Reads only `INSTITUTIONAL DUAL MATCH` style alerts from the source chat.
-- Extracts `BANKNIFTY <strike> CE/PE`.
+- Extracts `ACTION: BUY <symbol> <strike> CE/PE`.
 - Opens only one active trade at a time.
 - Duplicate same signal is blocked for 10 minutes.
 - Reverse signal exits the old trade and opens the new one.
 - Entry is live Angel One LTP.
-- SL is `entry - 30`.
-- Targets are `entry + 30`, `+60`, `+90`, `+120`.
+- Index SL is `entry - 30`.
+- Index targets are `entry + 30`, `+60`, `+90`, `+120`.
+- Stock SL is `entry - 3`.
+- Stock targets are `entry + 3`, `+6`, `+9`, `+12`.
 - Monitor loop runs every 3 seconds.

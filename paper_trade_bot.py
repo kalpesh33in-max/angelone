@@ -33,6 +33,10 @@ MONITOR_INTERVAL_SECONDS = 3
 SCRIP_MASTER_FILE = "OpenAPIScripMaster.json"
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
+INDEX_UNDERLYINGS = {"BANKNIFTY", "NIFTY", "SENSEX", "MIDCPNIFTY"}
+STOCK_UNDERLYINGS = {"HDFCBANK", "ICICIBANK", "RELIANCE"}
+SUPPORTED_UNDERLYINGS = INDEX_UNDERLYINGS | STOCK_UNDERLYINGS
+
 
 def env(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
@@ -64,6 +68,7 @@ class Trade:
     option_type: str
     symbol: str
     token: str
+    exchange: str
     entry: float
     sl: float
     targets: list[float]
@@ -113,14 +118,23 @@ class Engine:
         self._ws_thread: threading.Thread | None = None
         self._ws_lock = threading.Lock()
         self._ws_token: str | None = None
+        self._ws_exchange: str | None = None
         self._ws_ltp: dict[str, float] = {}
         self._ws_ts: dict[str, float] = {}
 
     def step_points_for(self, underlying: str) -> float:
-        # Stocks (and MIDCPNIFTY) use tighter paper-trade steps.
-        if underlying in {"HDFCBANK", "ICICIBANK", "RELIANCE", "MIDCPNIFTY"}:
+        if underlying in STOCK_UNDERLYINGS:
             return 3.0
         return float(DEFAULT_STEP_POINTS)
+
+    def ws_exchange_type(self, exchange: str) -> int:
+        if not self._ws:
+            raise RuntimeError("Angel WS exchange lookup failed: websocket not initialized")
+        exchange_map = {
+            "NFO": self._ws.NSE_FO,
+            "BFO": self._ws.BSE_FO,
+        }
+        return exchange_map.get(exchange, self._ws.NSE_FO)
 
     def login(self) -> None:
         try:
@@ -156,15 +170,17 @@ class Engine:
             def _on_open(wsapp):
                 # Subscribe happens after _ws_token is set.
                 token = None
+                exchange = None
                 with self._ws_lock:
                     token = self._ws_token
+                    exchange = self._ws_exchange
                 if not token:
                     return
                 try:
                     self._ws.subscribe(
                         correlation_id="papertrade",
                         mode=self._ws.LTP_MODE,
-                        token_list=[{"exchangeType": self._ws.NSE_FO, "tokens": [str(token)]}],
+                        token_list=[{"exchangeType": self.ws_exchange_type(exchange or "NFO"), "tokens": [str(token)]}],
                     )
                 except Exception as exc:
                     print(f"Angel WS subscribe failed: {safe_error_detail(exc)}")
@@ -212,7 +228,7 @@ class Engine:
             self._ws_thread = threading.Thread(target=self._ws.connect, daemon=True)
             self._ws_thread.start()
 
-    def _subscribe_ws_token(self, token: str) -> None:
+    def _subscribe_ws_token(self, exchange: str, token: str) -> None:
         if not USE_ANGEL_WS:
             return
         self._ensure_ws()
@@ -220,16 +236,17 @@ class Engine:
             return
 
         with self._ws_lock:
-            if self._ws_token == token:
+            if self._ws_token == token and self._ws_exchange == exchange:
                 return
             self._ws_token = token
+            self._ws_exchange = exchange
 
         # If already connected, subscribe immediately (on_open also subscribes on reconnect).
         try:
             self._ws.subscribe(
                 correlation_id="papertrade",
                 mode=self._ws.LTP_MODE,
-                token_list=[{"exchangeType": self._ws.NSE_FO, "tokens": [str(token)]}],
+                token_list=[{"exchangeType": self.ws_exchange_type(exchange), "tokens": [str(token)]}],
             )
         except Exception:
             # Not yet connected; on_open will subscribe.
@@ -244,13 +261,13 @@ class Engine:
 
         df = pd.read_json(SCRIP_MASTER_FILE)
         df = df[
-            (df.exch_seg == "NFO")
-            & (df.name.isin(["BANKNIFTY", "NIFTY", "MIDCPNIFTY", "HDFCBANK", "ICICIBANK"]))
+            (df.exch_seg.isin(["NFO", "BFO"]))
+            & (df.name.isin(SUPPORTED_UNDERLYINGS))
         ].copy()
         df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y")
         self.df = df[df.expiry >= datetime.now()].copy()
 
-    def resolve(self, underlying: str, strike: int, option_type: str) -> tuple[str, str]:
+    def resolve(self, underlying: str, strike: int, option_type: str) -> tuple[str, str, str]:
         df = self.df[
             (self.df.name == underlying)
             & (self.df.symbol.str.contains(f"{strike}{option_type}", regex=False))
@@ -258,9 +275,9 @@ class Engine:
         if df.empty:
             raise RuntimeError(f"Scrip not found: {underlying} {strike} {option_type}")
         row = df.sort_values("expiry").iloc[0]
-        return row.symbol, row.token
+        return row.symbol, row.token, row.exch_seg
 
-    def ltp(self, symbol: str, token: str) -> float:
+    def ltp(self, exchange: str, symbol: str, token: str) -> float:
         if USE_ANGEL_WS:
             now_ts = time.time()
             with self._ws_lock:
@@ -270,7 +287,7 @@ class Engine:
                 return float(ws_price)
 
         try:
-            response = self.smart.ltpData("NFO", symbol, token)
+            response = self.smart.ltpData(exchange, symbol, token)
 
             # SmartAPI responses can occasionally come back as JSON strings.
             if isinstance(response, str):
@@ -307,14 +324,15 @@ class Engine:
         upper = text.upper()
         if "INSTITUTIONAL DUAL MATCH" not in upper:
             return None
+        symbol_pattern = "|".join(sorted(SUPPORTED_UNDERLYINGS, key=len, reverse=True))
         match = re.search(
-            r"ACTION:\s*BUY\s+(BANKNIFTY|NIFTY|MIDCPNIFTY|HDFCBANK|ICICIBANK)\s+(\d+)\s*(CE|PE)",
+            rf"ACTION:\s*BUY\s+({symbol_pattern})\s+(\d+)\s*(CE|PE)",
             text,
             re.IGNORECASE,
         )
         if not match:
             match = re.search(
-                r"(BANKNIFTY|NIFTY|MIDCPNIFTY|HDFCBANK|ICICIBANK)\s+(\d+)\s*(CE|PE)",
+                rf"({symbol_pattern})\s+(\d+)\s*(CE|PE)",
                 text,
                 re.IGNORECASE,
             )
@@ -330,10 +348,10 @@ class Engine:
         return False
 
     def create_trade(self, underlying: str, strike: int, option_type: str) -> Trade:
-        symbol, token = self.resolve(underlying, strike, option_type)
-        self._subscribe_ws_token(token)
+        symbol, token, exchange = self.resolve(underlying, strike, option_type)
+        self._subscribe_ws_token(exchange, token)
         step_points = self.step_points_for(underlying)
-        price = self.ltp(symbol, token)
+        price = self.ltp(exchange, symbol, token)
         targets = [price + step_points * i for i in range(1, MAX_TARGET_LEVEL + 1)]
         return Trade(
             underlying=underlying,
@@ -341,6 +359,7 @@ class Engine:
             option_type=option_type,
             symbol=symbol,
             token=token,
+            exchange=exchange,
             entry=price,
             sl=price - step_points,
             targets=targets,
@@ -358,7 +377,7 @@ class Engine:
 
         # Reverse only within the same underlying (BANKNIFTY vs NIFTY are independent).
         if active and active.option_type != option_type:
-            exit_price = self.ltp(active.symbol, active.token)
+            exit_price = self.ltp(active.exchange, active.symbol, active.token)
             old_trade = active
             new_trade = self.create_trade(underlying, strike, option_type)
             self.trades[underlying] = new_trade
@@ -379,7 +398,7 @@ class Engine:
         to_delete: list[str] = []
 
         for underlying, trade in list(self.trades.items()):
-            price = self.ltp(trade.symbol, trade.token)
+            price = self.ltp(trade.exchange, trade.symbol, trade.token)
 
             if price <= trade.sl:
                 messages.append(f"\u274c {underlying} SL HIT @ {price:.2f}")
