@@ -119,7 +119,7 @@ class Engine:
     def step_points_for(self, underlying: str) -> float:
         # Stocks (and MIDCPNIFTY) use tighter paper-trade steps.
         if underlying in {"HDFCBANK", "ICICIBANK", "RELIANCE", "MIDCPNIFTY"}:
-            return 10.0
+            return 3.0
         return float(DEFAULT_STEP_POINTS)
 
     def login(self) -> None:
