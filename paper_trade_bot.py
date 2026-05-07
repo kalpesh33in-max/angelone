@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -269,8 +270,36 @@ class Engine:
                 return float(ws_price)
 
         try:
-            data = self.smart.ltpData("NFO", symbol, token)
-            return float(data["data"]["ltp"])
+            response = self.smart.ltpData("NFO", symbol, token)
+
+            # SmartAPI responses can occasionally come back as JSON strings.
+            if isinstance(response, str):
+                try:
+                    response = json.loads(response)
+                except Exception:
+                    pass
+
+            if isinstance(response, dict):
+                data_block: Any = response.get("data")
+                if isinstance(data_block, str):
+                    try:
+                        data_block = json.loads(data_block)
+                    except Exception:
+                        pass
+
+                if isinstance(data_block, dict):
+                    raw = data_block.get("ltp") or data_block.get("LTP") or data_block.get("last_traded_price")
+                    if raw is not None:
+                        return float(raw)
+
+                raw = response.get("ltp") or response.get("LTP")
+                if raw is not None:
+                    return float(raw)
+
+                message = response.get("message") or response.get("error") or response.get("status")
+                raise RuntimeError(f"Unexpected ltpData payload: {message or 'missing ltp'}")
+
+            raise RuntimeError(f"Unexpected ltpData response type: {type(response).__name__}")
         except Exception as exc:
             raise RuntimeError(f"LTP fetch failed for {symbol}: {safe_error_detail(exc)}") from None
 
