@@ -42,7 +42,29 @@ def env(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
 
 
-USE_ANGEL_WS = str(env("USE_ANGEL_WS", "false")).lower() in ("true", "1", "yes")
+def env_bool(name: str, default: str = "false") -> bool:
+    return str(env(name, default)).lower() in ("true", "1", "yes")
+
+
+def env_int(name: str, default: str) -> int:
+    return int(str(env(name, default)).strip())
+
+
+def parse_symbols(value: str | None, default: set[str]) -> set[str]:
+    if not value:
+        return set(default)
+    symbols = {item.strip().upper() for item in value.split(",") if item.strip()}
+    return symbols or set(default)
+
+
+def parse_hhmm(value: str, default: str) -> datetime.time:
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except Exception:
+        return datetime.strptime(default, "%H:%M").time()
+
+
+USE_ANGEL_WS = env_bool("USE_ANGEL_WS", "false")
 WS_MAX_AGE_SECONDS = float(env("WS_MAX_AGE_SECONDS", "5") or 5)
 
 
@@ -60,6 +82,29 @@ ANGEL_CLIENT_ID = env("ANGEL_CLIENT_ID")
 ANGEL_PASSWORD = env("ANGEL_PASSWORD")
 ANGEL_TOTP_SECRET = env("ANGEL_TOTP_SECRET")
 
+REAL_TRADE_ENABLED = env_bool("REAL_TRADE_ENABLED", "false")
+REAL_PRODUCT_TYPE = str(env("REAL_PRODUCT_TYPE", "INTRADAY")).upper()
+REAL_ORDER_TYPE = str(env("REAL_ORDER_TYPE", "MARKET")).upper()
+REAL_ORDER_VARIETY = str(env("REAL_ORDER_VARIETY", "NORMAL")).upper()
+MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", "5")
+ALLOW_REAL_TRADING_AFTER_RAW = str(env("ALLOW_REAL_TRADING_AFTER", "09:20"))
+STOP_REAL_TRADING_AFTER_RAW = str(env("STOP_REAL_TRADING_AFTER", "15:10"))
+ALLOW_REAL_TRADING_AFTER = parse_hhmm(ALLOW_REAL_TRADING_AFTER_RAW, "09:20")
+STOP_REAL_TRADING_AFTER = parse_hhmm(STOP_REAL_TRADING_AFTER_RAW, "15:10")
+TRADE_UNDERLYINGS = parse_symbols(env("TRADE_UNDERLYINGS", "NIFTY,BANKNIFTY"), {"NIFTY", "BANKNIFTY"})
+REAL_ALLOWED_UNDERLYINGS = parse_symbols(env("REAL_ALLOWED_UNDERLYINGS", "NIFTY,BANKNIFTY"), {"NIFTY", "BANKNIFTY"})
+KEEPALIVE_ENABLED = env_bool("KEEPALIVE_ENABLED", "true")
+KEEPALIVE_INTERVAL_SECONDS = env_int("KEEPALIVE_INTERVAL_SECONDS", "300")
+KEEPALIVE_START_RAW = str(env("KEEPALIVE_START", "09:00"))
+KEEPALIVE_END_RAW = str(env("KEEPALIVE_END", "15:30"))
+KEEPALIVE_START = parse_hhmm(KEEPALIVE_START_RAW, "09:00")
+KEEPALIVE_END = parse_hhmm(KEEPALIVE_END_RAW, "15:30")
+STARTUP_CONFIRMATION_ENABLED = env_bool("STARTUP_CONFIRMATION_ENABLED", "true")
+LOT_SIZES = {
+    "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
+    "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
+}
+
 
 @dataclass
 class Trade:
@@ -73,6 +118,9 @@ class Trade:
     sl: float
     targets: list[float]
     step_points: float
+    qty: int
+    entry_order_id: str | None = None
+    exit_order_id: str | None = None
     highest_target: int = 0
     last_price_alert: float = 0.0
 
@@ -121,6 +169,8 @@ class Engine:
         self._ws_exchange: str | None = None
         self._ws_ltp: dict[str, float] = {}
         self._ws_ts: dict[str, float] = {}
+        self.real_trade_day = datetime.now(IST).date()
+        self.real_trades_today = 0
 
     def step_points_for(self, underlying: str) -> float:
         if underlying in STOCK_UNDERLYINGS:
@@ -320,6 +370,91 @@ class Engine:
         except Exception as exc:
             raise RuntimeError(f"LTP fetch failed for {symbol}: {safe_error_detail(exc)}") from None
 
+    def reset_daily_counter_if_needed(self) -> None:
+        today = datetime.now(IST).date()
+        if today != self.real_trade_day:
+            self.real_trade_day = today
+            self.real_trades_today = 0
+
+    def qty_for(self, underlying: str) -> int:
+        if underlying not in LOT_SIZES:
+            raise RuntimeError(f"No lot size configured for {underlying}")
+        return LOT_SIZES[underlying]
+
+    def real_entry_block_reason(self, underlying: str) -> str | None:
+        if not REAL_TRADE_ENABLED:
+            return None
+
+        self.reset_daily_counter_if_needed()
+        now_time = datetime.now(IST).time()
+
+        if underlying not in REAL_ALLOWED_UNDERLYINGS:
+            return f"{underlying} is not allowed for real trade"
+        if now_time < ALLOW_REAL_TRADING_AFTER:
+            return f"real trading starts after {ALLOW_REAL_TRADING_AFTER_RAW}"
+        if now_time >= STOP_REAL_TRADING_AFTER:
+            return f"real trading stops after {STOP_REAL_TRADING_AFTER_RAW}"
+        if self.real_trades_today >= MAX_TRADES_PER_DAY:
+            return f"max real trades reached: {MAX_TRADES_PER_DAY}"
+        return None
+
+    def extract_order_id(self, response: Any) -> str:
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict):
+                order_id = data.get("orderid") or data.get("order_id")
+                if order_id:
+                    return str(order_id)
+            if data:
+                return str(data)
+            order_id = response.get("orderid") or response.get("order_id")
+            if order_id:
+                return str(order_id)
+            raise RuntimeError(f"Order rejected: {response.get('message') or response.get('error') or response}")
+        if response:
+            return str(response)
+        raise RuntimeError("Order rejected: empty response")
+
+    def place_real_order(self, trade: Trade, transaction_type: str) -> str:
+        if not REAL_TRADE_ENABLED:
+            return ""
+        if not self.smart:
+            raise RuntimeError("Angel order failed: SmartAPI is not logged in")
+
+        order_params = {
+            "variety": REAL_ORDER_VARIETY,
+            "tradingsymbol": trade.symbol,
+            "symboltoken": trade.token,
+            "transactiontype": transaction_type,
+            "exchange": trade.exchange,
+            "ordertype": REAL_ORDER_TYPE,
+            "producttype": REAL_PRODUCT_TYPE,
+            "duration": "DAY",
+            "price": "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(trade.qty),
+        }
+
+        try:
+            response = self.smart.placeOrder(order_params)
+            return self.extract_order_id(response)
+        except Exception as exc:
+            raise RuntimeError(f"{transaction_type} order failed for {trade.symbol}: {safe_error_detail(exc)}") from None
+
+    def open_real_trade(self, trade: Trade) -> None:
+        order_id = self.place_real_order(trade, "BUY")
+        if order_id:
+            trade.entry_order_id = order_id
+            self.reset_daily_counter_if_needed()
+            self.real_trades_today += 1
+
+    def exit_real_trade(self, trade: Trade) -> str:
+        order_id = self.place_real_order(trade, "SELL")
+        if order_id:
+            trade.exit_order_id = order_id
+        return order_id
+
     def parse_dual_match(self, text: str) -> tuple[str, int, str] | None:
         upper = text.upper()
         if "INSTITUTIONAL DUAL MATCH" not in upper:
@@ -353,6 +488,7 @@ class Engine:
         step_points = self.step_points_for(underlying)
         price = self.ltp(exchange, symbol, token)
         targets = [price + step_points * i for i in range(1, MAX_TARGET_LEVEL + 1)]
+        qty = self.qty_for(underlying)
         return Trade(
             underlying=underlying,
             strike=strike,
@@ -364,11 +500,15 @@ class Engine:
             sl=price - step_points,
             targets=targets,
             step_points=step_points,
+            qty=qty,
             highest_target=0,
             last_price_alert=price,
         )
 
     def process_signal(self, underlying: str, strike: int, option_type: str):
+        if underlying not in TRADE_UNDERLYINGS:
+            return None, "SYMBOL_BLOCKED"
+
         key = f"{underlying}_{strike}{option_type}"
         if self.duplicate(key):
             return None, "DUP"
@@ -377,16 +517,36 @@ class Engine:
 
         # Reverse only within the same underlying (BANKNIFTY vs NIFTY are independent).
         if active and active.option_type != option_type:
+            block_reason = self.real_entry_block_reason(underlying)
+            new_trade = None
+            if not block_reason:
+                new_trade = self.create_trade(underlying, strike, option_type)
             exit_price = self.ltp(active.exchange, active.symbol, active.token)
             old_trade = active
-            new_trade = self.create_trade(underlying, strike, option_type)
-            self.trades[underlying] = new_trade
-            return ("REV", old_trade, exit_price, new_trade)
+            exit_order_id = self.exit_real_trade(old_trade) if REAL_TRADE_ENABLED else ""
+
+            if block_reason:
+                self.trades.pop(underlying, None)
+                return ("EXIT_ONLY", old_trade, exit_price, exit_order_id, block_reason)
+
+            if new_trade:
+                try:
+                    self.open_real_trade(new_trade)
+                except Exception:
+                    self.trades.pop(underlying, None)
+                    raise
+                self.trades[underlying] = new_trade
+                return ("REV", old_trade, exit_price, exit_order_id, new_trade)
 
         if active:
             return None, "ACTIVE"
 
+        block_reason = self.real_entry_block_reason(underlying)
+        if block_reason:
+            return None, f"REAL_BLOCKED: {block_reason}"
+
         new_trade = self.create_trade(underlying, strike, option_type)
+        self.open_real_trade(new_trade)
         self.trades[underlying] = new_trade
         return ("NEW", new_trade)
 
@@ -400,8 +560,17 @@ class Engine:
         for underlying, trade in list(self.trades.items()):
             price = self.ltp(trade.exchange, trade.symbol, trade.token)
 
+            if REAL_TRADE_ENABLED and datetime.now(IST).time() >= STOP_REAL_TRADING_AFTER:
+                exit_order_id = self.exit_real_trade(trade)
+                suffix = f" | SELL Order: {exit_order_id}" if exit_order_id else ""
+                messages.append(f"\u23f1\ufe0f {underlying} TIME EXIT @ {price:.2f}{suffix}")
+                to_delete.append(underlying)
+                continue
+
             if price <= trade.sl:
-                messages.append(f"\u274c {underlying} SL HIT @ {price:.2f}")
+                exit_order_id = self.exit_real_trade(trade) if REAL_TRADE_ENABLED else ""
+                suffix = f" | SELL Order: {exit_order_id}" if exit_order_id else ""
+                messages.append(f"\u274c {underlying} SL HIT @ {price:.2f}{suffix}")
                 to_delete.append(underlying)
                 continue
 
@@ -427,10 +596,15 @@ engine = Engine()
 
 
 def format_trade(trade: Trade) -> str:
-    return "\n".join(
+    lines = [
+        f"\U0001f525 {trade.underlying} {trade.strike} {trade.option_type}",
+        "",
+        f"Qty: {trade.qty}",
+    ]
+    if trade.entry_order_id:
+        lines.append(f"BUY Order: {trade.entry_order_id}")
+    lines.extend(
         [
-            f"\U0001f525 {trade.underlying} {trade.strike} {trade.option_type}",
-            "",
             f"\U0001f4cd Entry: {trade.entry:.2f}",
             f"\U0001f6e1\ufe0f SL: {trade.sl:.2f}",
             f"\U0001f3af T1: {trade.targets[0]:.2f}",
@@ -439,6 +613,7 @@ def format_trade(trade: Trade) -> str:
             f"\U0001f3af T4: {trade.targets[3]:.2f}",
         ]
     )
+    return "\n".join(lines)
 
 
 def send_output(text: str) -> None:
@@ -452,6 +627,48 @@ def send_output(text: str) -> None:
             raise RuntimeError(f"Telegram send failed with HTTP {response.status_code}")
     except Exception as exc:
         raise RuntimeError(f"Telegram send failed: {safe_error(exc)}") from None
+
+
+def time_in_window(now_time: datetime.time, start: datetime.time, end: datetime.time) -> bool:
+    return start <= now_time < end
+
+
+def runtime_summary() -> str:
+    return "\n".join(
+        [
+            "REAL TRADE BOT STARTED",
+            f"Mode: {'REAL' if REAL_TRADE_ENABLED else 'PAPER'}",
+            f"Source: {SOURCE_CHAT}",
+            f"Trade symbols: {','.join(sorted(TRADE_UNDERLYINGS))}",
+            f"Allowed real symbols: {','.join(sorted(REAL_ALLOWED_UNDERLYINGS))}",
+            f"Qty: {','.join(f'{symbol}={qty}' for symbol, qty in sorted(LOT_SIZES.items()))}",
+            f"Real entry window: {ALLOW_REAL_TRADING_AFTER_RAW}-{STOP_REAL_TRADING_AFTER_RAW}",
+            f"Max real entries/day: {MAX_TRADES_PER_DAY}",
+            f"Keepalive: {'ON' if KEEPALIVE_ENABLED else 'OFF'} {KEEPALIVE_START_RAW}-{KEEPALIVE_END_RAW}",
+        ]
+    )
+
+
+def telegram_keepalive() -> None:
+    if not OUTPUT_BOT_TOKEN:
+        return
+    response = requests.get(
+        f"https://api.telegram.org/bot{OUTPUT_BOT_TOKEN}/getMe",
+        timeout=15,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Telegram keepalive failed with HTTP {response.status_code}")
+
+
+async def keepalive_loop() -> None:
+    while True:
+        if KEEPALIVE_ENABLED and time_in_window(datetime.now(IST).time(), KEEPALIVE_START, KEEPALIVE_END):
+            try:
+                telegram_keepalive()
+                print("Market-hours keepalive ok.")
+            except Exception as exc:
+                print(f"Market-hours keepalive failed: {safe_error_detail(exc)}")
+        await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
 
 
 async def monitor_loop() -> None:
@@ -478,6 +695,23 @@ async def main() -> None:
     client = TelegramClient(StringSession(TG_SESSION_STR), TG_API_ID, TG_API_HASH)
     await client.start()
     print(f"Listening to source chat: {SOURCE_CHAT}")
+    print(
+        "Real trading:",
+        "ON" if REAL_TRADE_ENABLED else "OFF",
+        "| Trade symbols:",
+        ",".join(sorted(TRADE_UNDERLYINGS)),
+        "| Qty:",
+        ",".join(f"{symbol}={qty}" for symbol, qty in sorted(LOT_SIZES.items())),
+        "| Window:",
+        f"{ALLOW_REAL_TRADING_AFTER_RAW}-{STOP_REAL_TRADING_AFTER_RAW}",
+        "| Max/day:",
+        MAX_TRADES_PER_DAY,
+    )
+    if STARTUP_CONFIRMATION_ENABLED:
+        try:
+            send_output(runtime_summary())
+        except Exception as exc:
+            print(f"Startup confirmation send failed: {safe_error_detail(exc)}")
 
     @client.on(events.NewMessage())
     async def handler(event):
@@ -527,18 +761,33 @@ async def main() -> None:
         if not result:
             print("No action taken for signal.")
             return
+        if result[0] is None:
+            print(f"No trade action: {result[1] if len(result) > 1 else 'UNKNOWN'}")
+            return
 
         if result[0] == "REV":
-            _, old_trade, exit_price, new_trade = result
+            _, old_trade, exit_price, exit_order_id, new_trade = result
+            exit_suffix = f" | SELL Order: {exit_order_id}" if exit_order_id else ""
             try:
                 send_output(
-                    f"\U0001f501 EXIT {old_trade.underlying} {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}"
+                    f"\U0001f501 EXIT {old_trade.underlying} {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}{exit_suffix}"
                 )
                 send_output(format_trade(new_trade))
             except Exception as exc:
                 print(f"Reversal send failed: {safe_error_detail(exc)}")
                 return
             print("Reversal processed and output sent.")
+        elif result[0] == "EXIT_ONLY":
+            _, old_trade, exit_price, exit_order_id, reason = result
+            exit_suffix = f" | SELL Order: {exit_order_id}" if exit_order_id else ""
+            try:
+                send_output(
+                    f"\U0001f501 EXIT {old_trade.underlying} {old_trade.strike} {old_trade.option_type} @ {exit_price:.2f}{exit_suffix}\nNo new entry: {reason}"
+                )
+            except Exception as exc:
+                print(f"Exit-only send failed: {safe_error_detail(exc)}")
+                return
+            print("Exit-only reversal processed.")
         elif result[0] == "NEW":
             _, trade = result
             try:
@@ -548,7 +797,7 @@ async def main() -> None:
                 return
             print("New trade created and output sent.")
 
-    await asyncio.gather(client.run_until_disconnected(), monitor_loop())
+    await asyncio.gather(client.run_until_disconnected(), monitor_loop(), keepalive_loop())
 
 
 if __name__ == "__main__":

@@ -94,6 +94,22 @@ ANGEL_API_KEY=
 ANGEL_CLIENT_ID=
 ANGEL_PASSWORD=
 ANGEL_TOTP_SECRET=
+
+REAL_TRADE_ENABLED=false
+REAL_PRODUCT_TYPE=INTRADAY
+REAL_ORDER_TYPE=MARKET
+MAX_TRADES_PER_DAY=5
+ALLOW_REAL_TRADING_AFTER=09:20
+STOP_REAL_TRADING_AFTER=15:10
+TRADE_UNDERLYINGS=NIFTY,BANKNIFTY
+REAL_ALLOWED_UNDERLYINGS=NIFTY,BANKNIFTY
+NIFTY_LOT_SIZE=65
+BANKNIFTY_LOT_SIZE=30
+KEEPALIVE_ENABLED=true
+KEEPALIVE_INTERVAL_SECONDS=300
+KEEPALIVE_START=09:00
+KEEPALIVE_END=15:30
+STARTUP_CONFIRMATION_ENABLED=true
 ```
 
 ## Run
@@ -108,7 +124,7 @@ python paper_trade_bot.py
 
 - Reads only `INSTITUTIONAL DUAL MATCH` style alerts from the source chat.
 - Extracts `ACTION: BUY <symbol> <strike> CE/PE`.
-- Opens only one active trade at a time.
+- Opens one active trade per allowed underlying.
 - Duplicate same signal is blocked for 10 minutes.
 - Reverse signal exits the old trade and opens the new one.
 - Entry is live Angel One LTP.
@@ -117,3 +133,10 @@ python paper_trade_bot.py
 - Stock SL is `entry - 3`.
 - Stock targets are `entry + 3`, `+6`, `+9`, `+12`.
 - Monitor loop runs every 3 seconds.
+- By default real trading is OFF. Set `REAL_TRADE_ENABLED=true` only when you want live Angel One orders.
+- Current real-trade scope is only `NIFTY` and `BANKNIFTY`.
+- Real quantity is one lot: `NIFTY=65`, `BANKNIFTY=30`.
+- Real entries are blocked before `09:20`, after `15:10`, and after 5 real entries per day.
+- If a real trade is open at `15:10`, the bot sends a market SELL exit.
+- During `09:00-15:30`, keepalive calls Telegram `getMe` every 5 minutes so Railway Serverless does not see the worker as idle.
+- On startup, the bot sends one Telegram confirmation showing mode, symbols, quantity, entry window, and max trades.
