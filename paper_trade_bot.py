@@ -99,6 +99,7 @@ KEEPALIVE_START_RAW = str(env("KEEPALIVE_START", "09:00"))
 KEEPALIVE_END_RAW = str(env("KEEPALIVE_END", "15:30"))
 KEEPALIVE_START = parse_hhmm(KEEPALIVE_START_RAW, "09:00")
 KEEPALIVE_END = parse_hhmm(KEEPALIVE_END_RAW, "15:30")
+KEEPALIVE_LOG_ENABLED = env_bool("KEEPALIVE_LOG_ENABLED", "false")
 STARTUP_CONFIRMATION_ENABLED = env_bool("STARTUP_CONFIRMATION_ENABLED", "true")
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
@@ -634,19 +635,7 @@ def time_in_window(now_time: datetime.time, start: datetime.time, end: datetime.
 
 
 def runtime_summary() -> str:
-    return "\n".join(
-        [
-            "REAL TRADE BOT STARTED",
-            f"Mode: {'REAL' if REAL_TRADE_ENABLED else 'PAPER'}",
-            f"Source: {SOURCE_CHAT}",
-            f"Trade symbols: {','.join(sorted(TRADE_UNDERLYINGS))}",
-            f"Allowed real symbols: {','.join(sorted(REAL_ALLOWED_UNDERLYINGS))}",
-            f"Qty: {','.join(f'{symbol}={qty}' for symbol, qty in sorted(LOT_SIZES.items()))}",
-            f"Real entry window: {ALLOW_REAL_TRADING_AFTER_RAW}-{STOP_REAL_TRADING_AFTER_RAW}",
-            f"Max real entries/day: {MAX_TRADES_PER_DAY}",
-            f"Keepalive: {'ON' if KEEPALIVE_ENABLED else 'OFF'} {KEEPALIVE_START_RAW}-{KEEPALIVE_END_RAW}",
-        ]
-    )
+    return "SCANNER START"
 
 
 def telegram_keepalive() -> None:
@@ -665,7 +654,8 @@ async def keepalive_loop() -> None:
         if KEEPALIVE_ENABLED and time_in_window(datetime.now(IST).time(), KEEPALIVE_START, KEEPALIVE_END):
             try:
                 telegram_keepalive()
-                print("Market-hours keepalive ok.")
+                if KEEPALIVE_LOG_ENABLED:
+                    print("Market-hours keepalive ok.")
             except Exception as exc:
                 print(f"Market-hours keepalive failed: {safe_error_detail(exc)}")
         await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)

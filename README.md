@@ -109,6 +109,7 @@ KEEPALIVE_ENABLED=true
 KEEPALIVE_INTERVAL_SECONDS=300
 KEEPALIVE_START=09:00
 KEEPALIVE_END=15:30
+KEEPALIVE_LOG_ENABLED=false
 STARTUP_CONFIRMATION_ENABLED=true
 ```
 
@@ -139,4 +140,5 @@ python paper_trade_bot.py
 - Real entries are blocked before `09:20`, after `15:10`, and after 5 real entries per day.
 - If a real trade is open at `15:10`, the bot sends a market SELL exit.
 - During `09:00-15:30`, keepalive calls Telegram `getMe` every 5 minutes so Railway Serverless does not see the worker as idle.
+- Telegram startup confirmation is kept short: `SCANNER START`.
 - On startup, the bot sends one Telegram confirmation showing mode, symbols, quantity, entry window, and max trades.
