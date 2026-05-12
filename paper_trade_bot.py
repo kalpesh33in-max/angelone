@@ -1,6 +1,6 @@
 # =========================================================
 # PAPER + REAL TRADE BOT
-# PERMANENT STABLE VERSION
+# FINAL STABLE VERSION
 # =========================================================
 
 import asyncio
@@ -276,7 +276,8 @@ class Engine:
         )
 
         print(
-            "ANGEL LOGIN SUCCESS"
+            f"ANGEL LOGIN SUCCESS: "
+            f"{response}"
         )
 
         return response
@@ -547,7 +548,7 @@ class Engine:
         )
 
     # =====================================================
-    # PERMANENT ORDER FIX
+    # REAL ORDER
     # =====================================================
 
     def place_real_order(
@@ -576,7 +577,7 @@ class Engine:
                 "MARKET",
 
             "producttype":
-                "CARRYFORWARD",
+                "INTRADAY",
 
             "duration":
                 "DAY",
@@ -617,14 +618,31 @@ class Engine:
                 )
 
                 print(
-                    f"FULL ORDER RESPONSE: "
-                    f"{response}"
+                    f"RAW ANGEL RESPONSE TYPE: "
+                    f"{type(response)}"
                 )
 
-                if not response:
+                print(
+                    f"FULL ORDER RESPONSE: "
+                    f"{repr(response)}"
+                )
+
+                if response is None:
 
                     raise RuntimeError(
-                        "Empty response"
+                        "Angel returned None"
+                    )
+
+                if response == {}:
+
+                    raise RuntimeError(
+                        "Angel returned empty dict"
+                    )
+
+                if response == "":
+
+                    raise RuntimeError(
+                        "Angel returned empty string"
                     )
 
                 status = str(
@@ -675,6 +693,8 @@ class Engine:
                     f"ORDER ERROR: "
                     f"{safe_error(exc)}"
                 )
+
+                # RELOGIN
 
                 try:
 
@@ -825,9 +845,7 @@ class Engine:
                 underlying
             ]
 
-        # =================================================
-        # PAPER TRADE ALWAYS FIRST
-        # =================================================
+        # PAPER TRADE FIRST
 
         trade = self.create_trade(
             underlying,
@@ -843,9 +861,7 @@ class Engine:
             "PAPER TRADE CREATED"
         )
 
-        # =================================================
         # REAL TRADE SEPARATE
-        # =================================================
 
         if REAL_TRADE_ENABLED:
 
@@ -1210,9 +1226,7 @@ async def main():
 
                 return
 
-            # =================================================
             # ALWAYS SEND PAPER ALERT
-            # =================================================
 
             send_output(
                 format_trade(
