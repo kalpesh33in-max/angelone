@@ -1,3 +1,8 @@
+# =========================================================
+# PAPER + REAL TRADE BOT
+# PERMANENT STABLE VERSION
+# =========================================================
+
 import asyncio
 import logging
 import os
@@ -7,7 +12,6 @@ import json
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
 
 import pandas as pd
 import pyotp
@@ -77,12 +81,12 @@ SUPPORTED_UNDERLYINGS = (
 # =========================================================
 
 
-def env(name: str, default: str | None = None):
+def env(name, default=None):
 
     return os.getenv(name, default)
 
 
-def env_bool(name: str, default: str = "false"):
+def env_bool(name, default="false"):
 
     return str(
         env(name, default)
@@ -93,28 +97,11 @@ def env_bool(name: str, default: str = "false"):
     )
 
 
-def env_int(name: str, default: str):
+def env_int(name, default):
 
     return int(
         str(env(name, default)).strip()
     )
-
-
-def parse_symbols(
-    value: str | None,
-    default: set[str],
-):
-
-    if not value:
-        return set(default)
-
-    symbols = {
-        item.strip().upper()
-        for item in value.split(",")
-        if item.strip()
-    }
-
-    return symbols or set(default)
 
 # =========================================================
 # ENV
@@ -154,38 +141,6 @@ REAL_TRADE_ENABLED = env_bool(
     "false",
 )
 
-REAL_PRODUCT_TYPE = str(
-    env(
-        "REAL_PRODUCT_TYPE",
-        "INTRADAY",
-    )
-).upper()
-
-REAL_ORDER_TYPE = str(
-    env(
-        "REAL_ORDER_TYPE",
-        "MARKET",
-    )
-).upper()
-
-REAL_ORDER_VARIETY = str(
-    env(
-        "REAL_ORDER_VARIETY",
-        "NORMAL",
-    )
-).upper()
-
-TRADE_UNDERLYINGS = parse_symbols(
-    env(
-        "TRADE_UNDERLYINGS",
-        "NIFTY,BANKNIFTY",
-    ),
-    {
-        "NIFTY",
-        "BANKNIFTY",
-    },
-)
-
 LOT_SIZES = {
     "NIFTY": env_int(
         "NIFTY_LOT_SIZE",
@@ -198,7 +153,7 @@ LOT_SIZES = {
 }
 
 # =========================================================
-# TRADE CLASS
+# TRADE
 # =========================================================
 
 
@@ -221,7 +176,7 @@ class Trade:
 
     sl: float
 
-    targets: list[float]
+    targets: list
 
     step_points: float
 
@@ -238,7 +193,7 @@ class Trade:
 # =========================================================
 
 
-def safe_error(exc: Exception):
+def safe_error(exc):
 
     try:
         return str(exc)
@@ -247,11 +202,11 @@ def safe_error(exc: Exception):
         return type(exc).__name__
 
 # =========================================================
-# TELEGRAM OUTPUT
+# TG OUTPUT
 # =========================================================
 
 
-def send_output(text: str):
+def send_output(text):
 
     try:
 
@@ -277,7 +232,7 @@ def send_output(text: str):
     except Exception as exc:
 
         print(
-            f"TG SEND FAILED: "
+            f"TG SEND ERROR: "
             f"{safe_error(exc)}"
         )
 
@@ -294,15 +249,9 @@ class Engine:
 
         self.df = None
 
-        self.trades: dict[
-            str,
-            Trade,
-        ] = {}
+        self.trades = {}
 
-        self.last_signal: dict[
-            str,
-            datetime,
-        ] = {}
+        self.last_signal = {}
 
     # =====================================================
     # LOGIN
@@ -326,7 +275,9 @@ class Engine:
             totp,
         )
 
-        print("ANGEL LOGIN SUCCESS")
+        print(
+            "ANGEL LOGIN SUCCESS"
+        )
 
         return response
 
@@ -393,13 +344,13 @@ class Engine:
         )
 
     # =====================================================
-    # VALID STRIKE
+    # STRIKE VALIDATION
     # =====================================================
 
     def strike_valid(
         self,
-        underlying: str,
-        strike: int,
+        underlying,
+        strike,
     ):
 
         if underlying == "NIFTY":
@@ -411,9 +362,6 @@ class Engine:
         if underlying == "SENSEX":
             return 40000 <= strike <= 100000
 
-        if underlying == "MIDCPNIFTY":
-            return 5000 <= strike <= 20000
-
         return True
 
     # =====================================================
@@ -422,7 +370,7 @@ class Engine:
 
     def parse_dual_match(
         self,
-        text: str,
+        text,
     ):
 
         upper = text.upper()
@@ -495,7 +443,7 @@ class Engine:
 
     def duplicate(
         self,
-        key: str,
+        key,
     ):
 
         now = datetime.now(IST)
@@ -521,9 +469,9 @@ class Engine:
 
     def resolve(
         self,
-        underlying: str,
-        strike: int,
-        option_type: str,
+        underlying,
+        strike,
+        option_type,
     ):
 
         df = self.df[
@@ -564,9 +512,9 @@ class Engine:
 
     def ltp(
         self,
-        exchange: str,
-        symbol: str,
-        token: str,
+        exchange,
+        symbol,
+        token,
     ):
 
         response = self.smart.ltpData(
@@ -599,17 +547,18 @@ class Engine:
         )
 
     # =====================================================
-    # ORDER
+    # PERMANENT ORDER FIX
     # =====================================================
 
     def place_real_order(
         self,
-        trade: Trade,
+        trade,
     ):
 
         order_params = {
+
             "variety":
-                REAL_ORDER_VARIETY,
+                "NORMAL",
 
             "tradingsymbol":
                 trade.symbol,
@@ -624,10 +573,10 @@ class Engine:
                 trade.exchange,
 
             "ordertype":
-                REAL_ORDER_TYPE,
+                "MARKET",
 
             "producttype":
-                REAL_PRODUCT_TYPE,
+                "CARRYFORWARD",
 
             "duration":
                 "DAY",
@@ -655,45 +604,95 @@ class Engine:
             try:
 
                 print(
-                    f"ORDER ATTEMPT "
+                    f"REAL ORDER "
+                    f"ATTEMPT "
                     f"{attempt}"
                 )
 
                 response = (
-                    self.smart.placeOrder(
+                    self.smart
+                    .placeOrderFullResponse(
                         order_params
                     )
                 )
 
                 print(
-                    f"ORDER RESPONSE: "
+                    f"FULL ORDER RESPONSE: "
                     f"{response}"
                 )
 
-                if response:
+                if not response:
 
-                    return str(response)
+                    raise RuntimeError(
+                        "Empty response"
+                    )
+
+                status = str(
+                    response.get(
+                        "status",
+                        ""
+                    )
+                ).lower()
+
+                message = response.get(
+                    "message",
+                    ""
+                )
+
+                data = response.get(
+                    "data",
+                    {}
+                )
+
+                order_id = data.get(
+                    "orderid"
+                )
+
+                # SUCCESS
+
+                if (
+                    status == "success"
+                    and order_id
+                ):
+
+                    print(
+                        f"ORDER SUCCESS: "
+                        f"{order_id}"
+                    )
+
+                    return str(order_id)
+
+                raise RuntimeError(
+                    f"{message} | "
+                    f"{response}"
+                )
 
             except Exception as exc:
 
                 last_error = exc
 
                 print(
-                    f"ORDER FAILED: "
+                    f"ORDER ERROR: "
                     f"{safe_error(exc)}"
                 )
 
                 try:
+
                     self.login()
-                except Exception:
-                    pass
+
+                except Exception as relogin_exc:
+
+                    print(
+                        f"RELOGIN FAILED: "
+                        f"{safe_error(relogin_exc)}"
+                    )
 
                 time.sleep(
                     ORDER_RETRY_DELAY
                 )
 
         raise RuntimeError(
-            f"ORDER FAILED: "
+            f"FINAL ORDER FAILURE: "
             f"{safe_error(last_error)}"
         )
 
@@ -703,7 +702,7 @@ class Engine:
 
     def step_points_for(
         self,
-        underlying: str,
+        underlying,
     ):
 
         if (
@@ -723,9 +722,9 @@ class Engine:
 
     def create_trade(
         self,
-        underlying: str,
-        strike: int,
-        option_type: str,
+        underlying,
+        strike,
+        option_type,
     ):
 
         symbol, token, exchange = (
@@ -780,9 +779,9 @@ class Engine:
 
     def process_signal(
         self,
-        underlying: str,
-        strike: int,
-        option_type: str,
+        underlying,
+        strike,
+        option_type,
     ):
 
         key = (
@@ -793,7 +792,9 @@ class Engine:
 
         if self.duplicate(key):
 
-            print("DUPLICATE SIGNAL")
+            print(
+                "DUPLICATE SIGNAL"
+            )
 
             return None
 
@@ -801,7 +802,7 @@ class Engine:
             underlying
         )
 
-        # REVERSE SIGNAL
+        # REVERSE
 
         if active:
 
@@ -824,29 +825,48 @@ class Engine:
                 underlying
             ]
 
+        # =================================================
+        # PAPER TRADE ALWAYS FIRST
+        # =================================================
+
         trade = self.create_trade(
             underlying,
             strike,
             option_type,
         )
 
-        # REAL TRADE
-
-        if REAL_TRADE_ENABLED:
-
-            order_id = (
-                self.place_real_order(
-                    trade
-                )
-            )
-
-            trade.entry_order_id = (
-                order_id
-            )
-
         self.trades[
             underlying
         ] = trade
+
+        print(
+            "PAPER TRADE CREATED"
+        )
+
+        # =================================================
+        # REAL TRADE SEPARATE
+        # =================================================
+
+        if REAL_TRADE_ENABLED:
+
+            try:
+
+                order_id = (
+                    self.place_real_order(
+                        trade
+                    )
+                )
+
+                trade.entry_order_id = (
+                    order_id
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"REAL TRADE FAILED: "
+                    f"{safe_error(exc)}"
+                )
 
         return trade
 
@@ -928,7 +948,7 @@ class Engine:
                     messages.append(
                         f"📈 "
                         f"{underlying} "
-                        f"Price Update: "
+                        f" Price Update: "
                         f"{price:.2f}"
                     )
 
@@ -952,7 +972,7 @@ engine = Engine()
 # =========================================================
 
 
-def format_trade(trade: Trade):
+def format_trade(trade):
 
     lines = [
         f"🔥 "
@@ -995,7 +1015,7 @@ def format_trade(trade: Trade):
     return "\n".join(lines)
 
 # =========================================================
-# MONITOR LOOP
+# MONITOR
 # =========================================================
 
 
@@ -1124,7 +1144,7 @@ async def main():
                 return
 
             # =================================================
-            # LOG
+            # VALID SOURCE
             # =================================================
 
             print(
@@ -1133,11 +1153,6 @@ async def main():
 
             print(
                 "VALID SOURCE MESSAGE"
-            )
-
-            print(
-                f"CHAT ID: "
-                f"{event.chat_id}"
             )
 
             print(
@@ -1194,6 +1209,10 @@ async def main():
                 )
 
                 return
+
+            # =================================================
+            # ALWAYS SEND PAPER ALERT
+            # =================================================
 
             send_output(
                 format_trade(
