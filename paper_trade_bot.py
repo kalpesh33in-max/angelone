@@ -4,6 +4,7 @@ import os
 import re
 import time
 import json
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -20,21 +21,27 @@ from SmartApi.smartConnect import SmartConnect
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+# =========================================================
+# TIMEZONE
+# =========================================================
+
 IST = pytz.timezone("Asia/Kolkata")
 
-# -------------------------------------------------------
-# LOGGING
-# -------------------------------------------------------
+# =========================================================
+# SILENT LOGS
+# =========================================================
 
 loglevel(logging.CRITICAL)
 
-# -------------------------------------------------------
+# =========================================================
 # CONFIG
-# -------------------------------------------------------
+# =========================================================
 
 DEFAULT_STEP_POINTS = 30
 MAX_TARGET_LEVEL = 4
+
 DUPLICATE_MINUTES = 10
+
 MONITOR_INTERVAL_SECONDS = 3
 
 ORDER_RETRY_COUNT = 3
@@ -65,9 +72,9 @@ SUPPORTED_UNDERLYINGS = (
     | STOCK_UNDERLYINGS
 )
 
-# -------------------------------------------------------
+# =========================================================
 # ENV HELPERS
-# -------------------------------------------------------
+# =========================================================
 
 
 def env(name: str, default: str | None = None):
@@ -109,10 +116,9 @@ def parse_symbols(
 
     return symbols or set(default)
 
-
-# -------------------------------------------------------
+# =========================================================
 # ENV
-# -------------------------------------------------------
+# =========================================================
 
 TG_API_ID = int(env("TG_API_ID"))
 
@@ -169,11 +175,6 @@ REAL_ORDER_VARIETY = str(
     )
 ).upper()
 
-MAX_TRADES_PER_DAY = env_int(
-    "MAX_TRADES_PER_DAY",
-    "5",
-)
-
 TRADE_UNDERLYINGS = parse_symbols(
     env(
         "TRADE_UNDERLYINGS",
@@ -196,9 +197,9 @@ LOT_SIZES = {
     ),
 }
 
-# -------------------------------------------------------
-# DATA CLASS
-# -------------------------------------------------------
+# =========================================================
+# TRADE CLASS
+# =========================================================
 
 
 @dataclass
@@ -232,10 +233,9 @@ class Trade:
 
     last_price_alert: float = 0.0
 
-
-# -------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------
+# =========================================================
+# SAFE ERROR
+# =========================================================
 
 
 def safe_error(exc: Exception):
@@ -246,30 +246,44 @@ def safe_error(exc: Exception):
     except Exception:
         return type(exc).__name__
 
+# =========================================================
+# TELEGRAM OUTPUT
+# =========================================================
+
 
 def send_output(text: str):
 
-    print(f"SENDING TG MESSAGE:\n{text}")
+    try:
 
-    response = requests.post(
-        f"https://api.telegram.org/bot"
-        f"{OUTPUT_BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": OUTPUT_CHAT_ID,
-            "text": text,
-        },
-        timeout=30,
-    )
+        print(
+            f"SENDING TG:\n{text}"
+        )
 
-    print(
-        f"TG RESPONSE: "
-        f"{response.status_code}"
-    )
+        response = requests.post(
+            f"https://api.telegram.org/bot"
+            f"{OUTPUT_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": OUTPUT_CHAT_ID,
+                "text": text,
+            },
+            timeout=30,
+        )
 
+        print(
+            f"TG STATUS: "
+            f"{response.status_code}"
+        )
 
-# -------------------------------------------------------
+    except Exception as exc:
+
+        print(
+            f"TG SEND FAILED: "
+            f"{safe_error(exc)}"
+        )
+
+# =========================================================
 # ENGINE
-# -------------------------------------------------------
+# =========================================================
 
 
 class Engine:
@@ -280,16 +294,19 @@ class Engine:
 
         self.df = None
 
-        self.trades: dict[str, Trade] = {}
+        self.trades: dict[
+            str,
+            Trade,
+        ] = {}
 
         self.last_signal: dict[
             str,
             datetime,
         ] = {}
 
-    # ---------------------------------------------------
+    # =====================================================
     # LOGIN
-    # ---------------------------------------------------
+    # =====================================================
 
     def login(self):
 
@@ -309,18 +326,17 @@ class Engine:
             totp,
         )
 
-        print(
-            f"ANGEL LOGIN SUCCESS: "
-            f"{response}"
-        )
+        print("ANGEL LOGIN SUCCESS")
 
-    # ---------------------------------------------------
+        return response
+
+    # =====================================================
     # LOAD MASTER
-    # ---------------------------------------------------
+    # =====================================================
 
     def load(self):
 
-        print("LOADING SCRIP MASTER")
+        print("LOADING MASTER")
 
         if not os.path.exists(
             SCRIP_MASTER_FILE
@@ -338,7 +354,9 @@ class Engine:
                 "wb",
             ) as fp:
 
-                fp.write(response.content)
+                fp.write(
+                    response.content
+                )
 
         df = pd.read_json(
             SCRIP_MASTER_FILE
@@ -370,13 +388,13 @@ class Engine:
         ].copy()
 
         print(
-            f"SCRIP MASTER LOADED: "
+            f"MASTER LOADED: "
             f"{len(self.df)}"
         )
 
-    # ---------------------------------------------------
-    # STRIKE VALIDATION
-    # ---------------------------------------------------
+    # =====================================================
+    # VALID STRIKE
+    # =====================================================
 
     def strike_valid(
         self,
@@ -393,11 +411,14 @@ class Engine:
         if underlying == "SENSEX":
             return 40000 <= strike <= 100000
 
+        if underlying == "MIDCPNIFTY":
+            return 5000 <= strike <= 20000
+
         return True
 
-    # ---------------------------------------------------
+    # =====================================================
     # PARSER
-    # ---------------------------------------------------
+    # =====================================================
 
     def parse_dual_match(
         self,
@@ -406,18 +427,10 @@ class Engine:
 
         upper = text.upper()
 
-        print(
-            f"RAW MESSAGE:\n{upper}"
-        )
-
         if (
             "INSTITUTIONAL DUAL MATCH"
             not in upper
         ):
-
-            print(
-                "NOT DUAL MATCH"
-            )
 
             return None
 
@@ -437,15 +450,7 @@ class Engine:
             re.IGNORECASE,
         )
 
-        print(
-            f"REGEX MATCHES: "
-            f"{matches}"
-        )
-
         if not matches:
-
-            print("NO MATCH")
-
             return None
 
         valid = []
@@ -479,19 +484,14 @@ class Engine:
                 )
             )
 
-        print(
-            f"VALID SIGNALS: "
-            f"{valid}"
-        )
-
         if not valid:
             return None
 
         return valid[-1]
 
-    # ---------------------------------------------------
+    # =====================================================
     # DUPLICATE
-    # ---------------------------------------------------
+    # =====================================================
 
     def duplicate(
         self,
@@ -515,9 +515,9 @@ class Engine:
 
         return False
 
-    # ---------------------------------------------------
+    # =====================================================
     # RESOLVE
-    # ---------------------------------------------------
+    # =====================================================
 
     def resolve(
         self,
@@ -525,13 +525,6 @@ class Engine:
         strike: int,
         option_type: str,
     ):
-
-        print(
-            f"RESOLVING: "
-            f"{underlying} "
-            f"{strike} "
-            f"{option_type}"
-        )
 
         df = self.df[
             (
@@ -559,20 +552,15 @@ class Engine:
             "expiry"
         ).iloc[0]
 
-        print(
-            f"RESOLVED SYMBOL: "
-            f"{row.symbol}"
-        )
-
         return (
             row.symbol,
             row.token,
             row.exch_seg,
         )
 
-    # ---------------------------------------------------
+    # =====================================================
     # LTP
-    # ---------------------------------------------------
+    # =====================================================
 
     def ltp(
         self,
@@ -610,9 +598,9 @@ class Engine:
             data.get("ltp")
         )
 
-    # ---------------------------------------------------
+    # =====================================================
     # ORDER
-    # ---------------------------------------------------
+    # =====================================================
 
     def place_real_order(
         self,
@@ -709,9 +697,9 @@ class Engine:
             f"{safe_error(last_error)}"
         )
 
-    # ---------------------------------------------------
+    # =====================================================
     # STEP
-    # ---------------------------------------------------
+    # =====================================================
 
     def step_points_for(
         self,
@@ -729,9 +717,9 @@ class Engine:
             DEFAULT_STEP_POINTS
         )
 
-    # ---------------------------------------------------
+    # =====================================================
     # CREATE TRADE
-    # ---------------------------------------------------
+    # =====================================================
 
     def create_trade(
         self,
@@ -768,7 +756,7 @@ class Engine:
             )
         ]
 
-        trade = Trade(
+        return Trade(
             underlying=underlying,
             strike=strike,
             option_type=option_type,
@@ -786,11 +774,9 @@ class Engine:
             ),
         )
 
-        return trade
-
-    # ---------------------------------------------------
+    # =====================================================
     # PROCESS SIGNAL
-    # ---------------------------------------------------
+    # =====================================================
 
     def process_signal(
         self,
@@ -814,6 +800,8 @@ class Engine:
         active = self.trades.get(
             underlying
         )
+
+        # REVERSE SIGNAL
 
         if active:
 
@@ -842,6 +830,8 @@ class Engine:
             option_type,
         )
 
+        # REAL TRADE
+
         if REAL_TRADE_ENABLED:
 
             order_id = (
@@ -860,9 +850,9 @@ class Engine:
 
         return trade
 
-    # ---------------------------------------------------
+    # =====================================================
     # UPDATE
-    # ---------------------------------------------------
+    # =====================================================
 
     def update(self):
 
@@ -883,6 +873,8 @@ class Engine:
                     trade.token,
                 )
 
+                # SL
+
                 if price <= trade.sl:
 
                     messages.append(
@@ -897,6 +889,8 @@ class Engine:
                     ]
 
                     continue
+
+                # TARGET
 
                 if (
                     trade.highest_target
@@ -916,9 +910,11 @@ class Engine:
                         f"{trade.option_type} "
                         f"T"
                         f"{trade.highest_target} "
-                        f"HIT @ "
+                        f" HIT @ "
                         f"{price:.2f}"
                     )
+
+                # PRICE UPDATE
 
                 if (
                     price
@@ -945,16 +941,15 @@ class Engine:
 
         return messages
 
-
-# -------------------------------------------------------
+# =========================================================
 # ENGINE
-# -------------------------------------------------------
+# =========================================================
 
 engine = Engine()
 
-# -------------------------------------------------------
+# =========================================================
 # FORMAT
-# -------------------------------------------------------
+# =========================================================
 
 
 def format_trade(trade: Trade):
@@ -999,9 +994,9 @@ def format_trade(trade: Trade):
 
     return "\n".join(lines)
 
-# -------------------------------------------------------
-# MONITOR
-# -------------------------------------------------------
+# =========================================================
+# MONITOR LOOP
+# =========================================================
 
 
 async def monitor_loop():
@@ -1027,9 +1022,9 @@ async def monitor_loop():
             MONITOR_INTERVAL_SECONDS
         )
 
-# -------------------------------------------------------
+# =========================================================
 # MAIN
-# -------------------------------------------------------
+# =========================================================
 
 
 async def main():
@@ -1067,32 +1062,82 @@ async def main():
                 or ""
             )
 
+            # =================================================
+            # SOURCE PROTECTION
+            # =================================================
+
+            source_match = False
+
+            source_value = str(
+                SOURCE_CHAT
+            ).strip().lower()
+
+            candidates = [
+                str(event.chat_id).lower()
+            ]
+
+            for value in (
+                getattr(
+                    chat,
+                    "title",
+                    None,
+                ),
+                getattr(
+                    chat,
+                    "username",
+                    None,
+                ),
+                getattr(
+                    chat,
+                    "first_name",
+                    None,
+                ),
+            ):
+
+                if value:
+
+                    candidates.append(
+                        str(value)
+                        .strip()
+                        .lower()
+                    )
+
+            print(
+                f"SOURCE CHECK: "
+                f"{candidates}"
+            )
+
+            if (
+                source_value
+                in candidates
+            ):
+
+                source_match = True
+
+            if not source_match:
+
+                print(
+                    "IGNORED "
+                    "NON SOURCE CHAT"
+                )
+
+                return
+
+            # =================================================
+            # LOG
+            # =================================================
+
             print(
                 "\n===================="
             )
 
             print(
-                "NEW TELEGRAM MESSAGE"
+                "VALID SOURCE MESSAGE"
             )
 
             print(
                 f"CHAT ID: "
                 f"{event.chat_id}"
-            )
-
-            print(
-                f"CHAT TITLE: "
-                f"{getattr(chat, 'title', None)}"
-            )
-
-            print(
-                f"USERNAME: "
-                f"{getattr(chat, 'username', None)}"
-            )
-
-            print(
-                f"FIRST NAME: "
-                f"{getattr(chat, 'first_name', None)}"
             )
 
             print(
@@ -1103,7 +1148,9 @@ async def main():
                 "====================\n"
             )
 
-            # ALWAYS LOG MESSAGE
+            # =================================================
+            # PARSE
+            # =================================================
 
             parsed = (
                 engine.parse_dual_match(
@@ -1126,7 +1173,7 @@ async def main():
             ) = parsed
 
             print(
-                f"SIGNAL DETECTED: "
+                f"SIGNAL: "
                 f"{underlying} "
                 f"{strike} "
                 f"{option_type}"
@@ -1143,7 +1190,7 @@ async def main():
             if not trade:
 
                 print(
-                    "NO TRADE CREATED"
+                    "NO TRADE"
                 )
 
                 return
@@ -1170,10 +1217,9 @@ async def main():
         monitor_loop(),
     )
 
-
-# -------------------------------------------------------
+# =========================================================
 # START
-# -------------------------------------------------------
+# =========================================================
 
 if __name__ == "__main__":
 
