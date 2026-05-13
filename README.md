@@ -97,7 +97,8 @@ ANGEL_TOTP_SECRET=
 
 REAL_TRADE_ENABLED=false
 REAL_PRODUCT_TYPE=INTRADAY
-REAL_ORDER_TYPE=MARKET
+REAL_ORDER_TYPE=LIMIT
+REAL_PRICE_BUFFER=1.0
 MAX_TRADES_PER_DAY=5
 ALLOW_REAL_TRADING_AFTER=09:20
 STOP_REAL_TRADING_AFTER=15:10
@@ -134,6 +135,10 @@ python paper_trade_bot.py
 - Stock SL is `entry - 3`.
 - Stock targets are `entry + 3`, `+6`, `+9`, `+12`.
 - Monitor loop runs every 3 seconds.
+- Real trade entry uses the same signal as paper trade.
+- Real trade exit follows the paper trade lifecycle: SL hit, reverse signal, or final target.
+- Trailing SL is virtual in the bot: after T1 SL moves to entry, after T2 SL moves to T1, after T3 SL moves to T2.
+- T4 is treated as final target exit.
 - By default real trading is OFF. Set `REAL_TRADE_ENABLED=true` only when you want live Angel One orders.
 - Current real-trade scope is only `NIFTY` and `BANKNIFTY`.
 - Real quantity is one lot: `NIFTY=65`, `BANKNIFTY=30`.

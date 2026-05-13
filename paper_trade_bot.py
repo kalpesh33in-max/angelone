@@ -27,6 +27,25 @@ def env(k, d=None):
 def env_bool(k, d="false"):
     return str(env(k, d)).lower() in ("true", "1", "yes")
 
+def env_int(k, d):
+    try:
+        return int(env(k, d))
+    except (TypeError, ValueError):
+        return int(d)
+
+def env_float(k, d):
+    try:
+        return float(env(k, d))
+    except (TypeError, ValueError):
+        return float(d)
+
+def env_csv(k, d):
+    return {
+        x.strip().upper()
+        for x in str(env(k, d)).split(",")
+        if x.strip()
+    }
+
 TG_API_ID = int(env("TG_API_ID"))
 TG_API_HASH = env("TG_API_HASH")
 TG_SESSION_STR = env("TG_SESSION_STR")
@@ -56,9 +75,44 @@ REAL_TRADE_ENABLED = env_bool(
     "false",
 )
 
+REAL_PRODUCT_TYPE = env(
+    "REAL_PRODUCT_TYPE",
+    "INTRADAY",
+).upper()
+
+REAL_ORDER_TYPE = env(
+    "REAL_ORDER_TYPE",
+    "LIMIT",
+).upper()
+
+REAL_PRICE_BUFFER = env_float(
+    "REAL_PRICE_BUFFER",
+    "1.0",
+)
+
+MAX_REAL_TRADES_PER_DAY = env_int(
+    "MAX_TRADES_PER_DAY",
+    "5",
+)
+
+ALLOW_REAL_TRADING_AFTER = env(
+    "ALLOW_REAL_TRADING_AFTER",
+    "09:20",
+)
+
+STOP_REAL_TRADING_AFTER = env(
+    "STOP_REAL_TRADING_AFTER",
+    "15:10",
+)
+
+REAL_ALLOWED_UNDERLYINGS = env_csv(
+    "REAL_ALLOWED_UNDERLYINGS",
+    "NIFTY,BANKNIFTY",
+)
+
 LOT_SIZES = {
-    "NIFTY": 65,
-    "BANKNIFTY": 30,
+    "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
+    "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
 }
 
 # =========================
@@ -96,6 +150,12 @@ def safe(e):
         return str(e)
     except:
         return type(e).__name__
+
+def hhmm(v):
+    return datetime.strptime(v, "%H:%M").time()
+
+def tick(v):
+    return round(round(float(v) / 0.05) * 0.05, 2)
 
 def tg(text):
 
@@ -140,6 +200,9 @@ class Trade:
     qty: int
 
     order_id: str | None = None
+    exit_order_id: str | None = None
+    real_open: bool = False
+    real_error: str | None = None
 
     target_hit: int = 0
     last_alert: float = 0
@@ -157,6 +220,8 @@ class Engine:
 
         self.trades = {}
         self.last_signal = {}
+        self.real_trade_day = None
+        self.real_entries_today = 0
 
     # =====================
 
@@ -333,7 +398,118 @@ class Engine:
     # REAL ORDER
     # =====================
 
-    def real_order(self, trade):
+    def reset_real_day(self):
+
+        today = datetime.now(IST).date()
+
+        if self.real_trade_day != today:
+            self.real_trade_day = today
+            self.real_entries_today = 0
+
+    # =====================
+
+    def real_entry_block_reason(self, u):
+
+        if not REAL_TRADE_ENABLED:
+            return "REAL_TRADE_ENABLED=false"
+
+        if u not in REAL_ALLOWED_UNDERLYINGS:
+            return f"{u} not in REAL_ALLOWED_UNDERLYINGS"
+
+        self.reset_real_day()
+
+        now = datetime.now(IST).time()
+
+        if now < hhmm(ALLOW_REAL_TRADING_AFTER):
+            return f"before {ALLOW_REAL_TRADING_AFTER}"
+
+        if now > hhmm(STOP_REAL_TRADING_AFTER):
+            return f"after {STOP_REAL_TRADING_AFTER}"
+
+        if self.real_entries_today >= MAX_REAL_TRADES_PER_DAY:
+            return "max real trades reached"
+
+        return None
+
+    # =====================
+
+    def real_price(self, side, ref_price):
+
+        if REAL_ORDER_TYPE == "MARKET":
+            return "0"
+
+        if ref_price is None:
+            raise RuntimeError(
+                "LIMIT order needs reference price"
+            )
+
+        if side == "BUY":
+            price = ref_price + REAL_PRICE_BUFFER
+        else:
+            price = max(
+                0.05,
+                ref_price - REAL_PRICE_BUFFER,
+            )
+
+        return f"{tick(price):.2f}"
+
+    # =====================
+
+    def order_id(self, r):
+
+        if isinstance(r, str):
+
+            text = r.strip()
+
+            if not text:
+                raise RuntimeError(
+                    "EMPTY ORDER RESPONSE"
+                )
+
+            try:
+                r = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+
+        if isinstance(r, (int, float)):
+            return str(r)
+
+        if not isinstance(r, dict):
+            raise RuntimeError(
+                f"BAD ORDER RESPONSE: {r}"
+            )
+
+        if r.get("status") is False:
+            raise RuntimeError(str(r))
+
+        data = r.get("data")
+
+        oid = None
+
+        if isinstance(data, dict):
+            oid = (
+                data.get("orderid")
+                or data.get("order_id")
+                or data.get("uniqueorderid")
+            )
+        elif isinstance(data, str):
+            oid = data
+
+        oid = (
+            oid
+            or r.get("orderid")
+            or r.get("order_id")
+            or r.get("uniqueorderid")
+        )
+
+        if not oid:
+            raise RuntimeError(str(r))
+
+        return str(oid)
+
+    # =====================
+
+    def real_order(self, trade, side, ref_price):
 
         params = {
 
@@ -346,23 +522,25 @@ class Engine:
                 trade.token,
 
             "transactiontype":
-                "BUY",
+                side,
 
             "exchange":
                 trade.exchange,
 
             "ordertype":
-                "MARKET",
+                REAL_ORDER_TYPE,
 
-            # IMPORTANT FIX
             "producttype":
-                "INTRADAY",
+                REAL_PRODUCT_TYPE,
 
             "duration":
                 "DAY",
 
             "price":
-                "0",
+                self.real_price(
+                    side,
+                    ref_price,
+                ),
 
             "quantity":
                 str(trade.qty),
@@ -375,7 +553,7 @@ class Engine:
             try:
 
                 print(
-                    f"REAL ORDER {i}"
+                    f"REAL {side} ORDER {i}: {params}"
                 )
 
                 r = (
@@ -389,24 +567,13 @@ class Engine:
                     f"ORDER RESPONSE: {r}"
                 )
 
-                if not r:
-                    raise RuntimeError(
-                        "EMPTY RESPONSE"
-                    )
+                oid = self.order_id(r)
 
-                data = r.get("data", {})
+                print(
+                    f"ORDER SUCCESS: {oid}"
+                )
 
-                oid = data.get("orderid")
-
-                if oid:
-
-                    print(
-                        f"ORDER SUCCESS: {oid}"
-                    )
-
-                    return str(oid)
-
-                raise RuntimeError(str(r))
+                return oid
 
             except Exception as e:
 
@@ -466,7 +633,82 @@ class Engine:
 
     # =====================
 
+    def trail_sl(self, trade):
+
+        if trade.target_hit <= 0:
+            return None
+
+        if trade.target_hit == 1:
+            new_sl = trade.entry
+        else:
+            new_sl = trade.targets[
+                trade.target_hit - 2
+            ]
+
+        if new_sl > trade.sl:
+            old = trade.sl
+            trade.sl = new_sl
+            return old, new_sl
+
+        return None
+
+    # =====================
+
+    def close_trade(self, trade, reason, price):
+
+        msgs = []
+
+        if not trade.real_open:
+            return True, msgs
+
+        if price is None:
+            price = self.ltp(
+                trade.exchange,
+                trade.symbol,
+                trade.token,
+            )
+
+        try:
+
+            oid = self.real_order(
+                trade,
+                "SELL",
+                price,
+            )
+
+            trade.exit_order_id = oid
+            trade.real_open = False
+
+            msgs.append(
+                f"✅ REAL SELL {trade.underlying} "
+                f"{trade.strike} "
+                f"{trade.option_type} "
+                f"@ {price:.2f} "
+                f"({reason}) "
+                f"ORDER: {oid}"
+            )
+
+            return True, msgs
+
+        except Exception as e:
+
+            trade.real_error = safe(e)
+
+            msgs.append(
+                f"⚠️ REAL EXIT FAILED "
+                f"{trade.underlying} "
+                f"{trade.strike} "
+                f"{trade.option_type}: "
+                f"{safe(e)}"
+            )
+
+            return False, msgs
+
+    # =====================
+
     def signal(self, u, s, ot):
+
+        msgs = []
 
         key = f"{u}_{s}_{ot}"
 
@@ -474,14 +716,32 @@ class Engine:
 
             print("DUP SIGNAL")
 
-            return None
+            return None, msgs
 
         active = self.trades.get(u)
 
         if active:
 
             if active.option_type == ot:
-                return None
+                return None, msgs
+
+            ok, exit_msgs = self.close_trade(
+                active,
+                "REVERSE SIGNAL",
+                None,
+            )
+
+            msgs.extend(exit_msgs)
+
+            if not ok:
+                return None, msgs
+
+            msgs.append(
+                f"🔄 {u} OLD "
+                f"{active.strike} "
+                f"{active.option_type} "
+                f"EXITED ON REVERSE SIGNAL"
+            )
 
             del self.trades[u]
 
@@ -503,17 +763,30 @@ class Engine:
 
             try:
 
-                oid = self.real_order(trade)
+                reason = self.real_entry_block_reason(u)
+
+                if reason:
+                    raise RuntimeError(reason)
+
+                oid = self.real_order(
+                    trade,
+                    "BUY",
+                    trade.entry,
+                )
 
                 trade.order_id = oid
+                trade.real_open = True
+                self.real_entries_today += 1
 
             except Exception as e:
+
+                trade.real_error = safe(e)
 
                 print(
                     f"REAL FAIL: {safe(e)}"
                 )
 
-        return trade
+        return trade, msgs
 
     # =====================
 
@@ -539,13 +812,24 @@ class Engine:
                         f"❌ {u} SL HIT @ {p:.2f}"
                     )
 
-                    del self.trades[u]
+                    ok, exit_msgs = self.close_trade(
+                        t,
+                        "SL HIT",
+                        p,
+                    )
+
+                    msgs.extend(exit_msgs)
+
+                    if ok:
+                        del self.trades[u]
 
                     continue
 
                 # TARGET
 
-                if (
+                closed = False
+
+                while (
                     t.target_hit < MAX_TARGET
                     and p >= t.targets[t.target_hit]
                 ):
@@ -559,6 +843,41 @@ class Engine:
                         f"T{t.target_hit} "
                         f"HIT @ {p:.2f}"
                     )
+
+                    if t.target_hit >= MAX_TARGET:
+
+                        msgs.append(
+                            f"✅ {u} FINAL TARGET EXIT @ {p:.2f}"
+                        )
+
+                        ok, exit_msgs = self.close_trade(
+                            t,
+                            "FINAL TARGET",
+                            p,
+                        )
+
+                        msgs.extend(exit_msgs)
+
+                        if ok:
+                            del self.trades[u]
+                            closed = True
+
+                        break
+
+                    trail = self.trail_sl(t)
+
+                    if trail:
+
+                        old_sl, new_sl = trail
+
+                        msgs.append(
+                            f"🔁 {u} TRAIL SL "
+                            f"{old_sl:.2f} -> "
+                            f"{new_sl:.2f}"
+                        )
+
+                if closed:
+                    continue
 
                 # PRICE
 
@@ -601,7 +920,11 @@ def fmt(t):
 
     if t.order_id:
         x.append(
-            f"BUY ORDER: {t.order_id}"
+            f"REAL BUY ORDER: {t.order_id}"
+        )
+    elif t.real_error:
+        x.append(
+            f"REAL NOT PLACED: {t.real_error}"
         )
 
     x.extend(
@@ -722,11 +1045,14 @@ async def main():
                 f"{u} {s} {ot}"
             )
 
-            trade = engine.signal(
+            trade, msgs = engine.signal(
                 u,
                 s,
                 ot,
             )
+
+            for msg in msgs:
+                tg(msg)
 
             if not trade:
                 return
