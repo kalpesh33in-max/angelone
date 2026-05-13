@@ -1,1078 +1,768 @@
-import asyncio
-import json
 import os
 import re
-import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-
-import pandas as pd
-import pyotp
+import asyncio
+import datetime
 import pytz
-import requests
-
-from SmartApi.smartConnect import SmartConnect
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+# ---------------- CONFIG ---------------- #
+
+API_ID = int(os.getenv("TG_API_ID"))
+API_HASH = os.getenv("TG_API_HASH")
+SESSION_STR = os.getenv("TG_SESSION_STR")
+
+SOURCE_IDS = [int(i.strip()) for i in os.getenv("SOURCE_BOT").split(",")]
+TARGET_BOT_RAW = os.getenv("TARGET_BOT", "").strip()
+
 IST = pytz.timezone("Asia/Kolkata")
 
-# =========================
-# ENV
-# =========================
+# ---------------- INSTRUMENT SPECS ---------------- #
 
-def env(k, d=None):
-    return os.getenv(k, d)
+INDEX_SYMBOLS = ["BANKNIFTY", "NIFTY", "SENSEX", "MIDCPNIFTY"]
+STOCK_SYMBOLS = ["HDFCBANK", "ICICIBANK", "RELIANCE"]
 
-def env_bool(k, d="false"):
-    return str(env(k, d)).lower() in ("true", "1", "yes")
+WATCH_SYMBOLS = INDEX_SYMBOLS + STOCK_SYMBOLS
 
-def env_int(k, d):
-    try:
-        return int(env(k, d))
-    except (TypeError, ValueError):
-        return int(d)
-
-def env_float(k, d):
-    try:
-        return float(env(k, d))
-    except (TypeError, ValueError):
-        return float(d)
-
-def env_csv(k, d):
-    return {
-        x.strip().upper()
-        for x in str(env(k, d)).split(",")
-        if x.strip()
-    }
-
-TG_API_ID = int(env("TG_API_ID"))
-TG_API_HASH = env("TG_API_HASH")
-TG_SESSION_STR = env("TG_SESSION_STR")
-
-SOURCE_CHAT = env(
-    "SOURCE_CHAT",
-    "Marketmenia_news",
-)
-
-BOT_TOKEN = (
-    env("PAPER_TRADE_BOT_TOKEN")
-    or env("TELE_TOKEN_MCX")
-)
-
-CHAT_ID = (
-    env("PAPER_TRADE_CHANNEL_ID")
-    or env("CHAT_ID_MCX")
-)
-
-ANGEL_API_KEY = env("ANGEL_API_KEY")
-ANGEL_CLIENT_ID = env("ANGEL_CLIENT_ID")
-ANGEL_PASSWORD = env("ANGEL_PASSWORD")
-ANGEL_TOTP_SECRET = env("ANGEL_TOTP_SECRET")
-
-REAL_TRADE_ENABLED = env_bool(
-    "REAL_TRADE_ENABLED",
-    "false",
-)
-
-REAL_PRODUCT_TYPE = env(
-    "REAL_PRODUCT_TYPE",
-    "INTRADAY",
-).upper()
-
-REAL_ORDER_TYPE = env(
-    "REAL_ORDER_TYPE",
-    "LIMIT",
-).upper()
-
-REAL_PRICE_BUFFER = env_float(
-    "REAL_PRICE_BUFFER",
-    "1.0",
-)
-
-MAX_REAL_TRADES_PER_DAY = env_int(
-    "MAX_TRADES_PER_DAY",
-    "5",
-)
-
-ALLOW_REAL_TRADING_AFTER = env(
-    "ALLOW_REAL_TRADING_AFTER",
-    "09:20",
-)
-
-STOP_REAL_TRADING_AFTER = env(
-    "STOP_REAL_TRADING_AFTER",
-    "15:10",
-)
-
-REAL_ALLOWED_UNDERLYINGS = env_csv(
-    "REAL_ALLOWED_UNDERLYINGS",
-    "NIFTY,BANKNIFTY",
-)
-
-LOT_SIZES = {
-    "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
-    "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
+# Strike steps
+STRIKE_STEPS = {
+    "BANKNIFTY": int(os.getenv("BANKNIFTY_STRIKE_STEP", "100")),
+    "NIFTY": int(os.getenv("NIFTY_STRIKE_STEP", "50")),
+    "SENSEX": int(os.getenv("SENSEX_STRIKE_STEP", "100")),
+    "MIDCPNIFTY": int(os.getenv("MIDCPNIFTY_STRIKE_STEP", "25")),
+    "HDFCBANK": 5,
+    "ICICIBANK": 10,
+    "RELIANCE": 10,
 }
 
-# =========================
-# CONFIG
-# =========================
+# Thresholds
+FUT_LOT_THRESHOLD = int(os.getenv("FUT_LOT_THRESHOLD", "2000"))
 
-STEP = 30
-MAX_TARGET = 4
-MONITOR_DELAY = 3
-DUP_MIN = 10
-
-MASTER_FILE = "OpenAPIScripMaster.json"
-
-MASTER_URL = (
-    "https://margincalculator.angelbroking.com/"
-    "OpenAPI_File/files/OpenAPIScripMaster.json"
+ITM_WRITER_THRESHOLD_CR = float(
+    os.getenv("ITM_WRITER_THRESHOLD_CR", "12")
 )
 
-SUPPORTED = {
-    "NIFTY",
-    "BANKNIFTY",
-    "SENSEX",
-    "MIDCPNIFTY",
-    "HDFCBANK",
-    "ICICIBANK",
-    "RELIANCE",
-}
+ITM_WRITER_CONFLICT_CR = float(
+    os.getenv("ITM_WRITER_CONFLICT_CR", "10")
+)
 
-# =========================
-# HELPERS
-# =========================
+# ---------------- STATE ---------------- #
 
-def safe(e):
-    try:
-        return str(e)
-    except:
-        return type(e).__name__
+last_fut_signals = {}
+last_signals_by_symbol = {}
+instant_itm_alerts = {}
 
-def hhmm(v):
-    return datetime.strptime(v, "%H:%M").time()
+# ---------------- UTILITY ---------------- #
 
-def tick(v):
-    return round(round(float(v) / 0.05) * 0.05, 2)
+def parse_target_ref(value):
+    if not value:
+        raise RuntimeError("TARGET_BOT env var missing")
 
-def tg(text):
-
-    print(f"TG:\n{text}")
-
-    try:
-
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": text,
-            },
-            timeout=30,
-        )
-
-        print(f"TG STATUS: {r.status_code}")
-
-    except Exception as e:
-
-        print(f"TG ERROR: {safe(e)}")
-
-# =========================
-# TRADE
-# =========================
-
-@dataclass
-class Trade:
-
-    underlying: str
-    strike: int
-    option_type: str
-
-    symbol: str
-    token: str
-    exchange: str
-
-    entry: float
-    sl: float
-    targets: list
-
-    qty: int
-
-    order_id: str | None = None
-    exit_order_id: str | None = None
-    real_open: bool = False
-    real_error: str | None = None
-
-    target_hit: int = 0
-    last_alert: float = 0
-
-# =========================
-# ENGINE
-# =========================
-
-class Engine:
-
-    def __init__(self):
-
-        self.smart = None
-        self.df = None
-
-        self.trades = {}
-        self.last_signal = {}
-        self.real_trade_day = None
-        self.real_entries_today = 0
-
-    # =====================
-
-    def login(self):
-
-        print("ANGEL LOGIN")
-
-        self.smart = SmartConnect(
-            api_key=ANGEL_API_KEY
-        )
-
-        totp = pyotp.TOTP(
-            ANGEL_TOTP_SECRET
-        ).now()
-
-        self.smart.generateSession(
-            ANGEL_CLIENT_ID,
-            ANGEL_PASSWORD,
-            totp,
-        )
-
-    # =====================
-
-    def load(self):
-
-        print("LOAD MASTER")
-
-        if not os.path.exists(MASTER_FILE):
-
-            r = requests.get(
-                MASTER_URL,
-                timeout=30,
-            )
-
-            with open(MASTER_FILE, "wb") as f:
-                f.write(r.content)
-
-        df = pd.read_json(MASTER_FILE)
-
-        df = df[
-            (df.exch_seg.isin(["NFO", "BFO"]))
-            & (df.name.isin(SUPPORTED))
-        ].copy()
-
-        df["expiry"] = pd.to_datetime(
-            df["expiry"],
-            format="%d%b%Y",
-        )
-
-        self.df = df[
-            df.expiry >= datetime.now()
-        ].copy()
-
-    # =====================
-
-    def strike_ok(self, u, s):
-
-        if u == "NIFTY":
-            return 18000 <= s <= 30000
-
-        if u == "BANKNIFTY":
-            return 35000 <= s <= 70000
-
-        return True
-
-    # =====================
-
-    def parse(self, text):
-
-        up = text.upper()
-
-        if "INSTITUTIONAL DUAL MATCH" not in up:
-            return None
-
-        pat = "|".join(
-            sorted(
-                SUPPORTED,
-                key=len,
-                reverse=True,
-            )
-        )
-
-        m = re.findall(
-            rf"({pat})\s+(\d{{4,6}})\s*(CE|PE)",
-            up,
-        )
-
-        if not m:
-            return None
-
-        valid = []
-
-        for sym, strike, ot in m:
-
-            strike = int(strike)
-
-            if not self.strike_ok(sym, strike):
-                continue
-
-            valid.append(
-                (
-                    sym,
-                    strike,
-                    ot,
-                )
-            )
-
-        return valid[-1] if valid else None
-
-    # =====================
-
-    def dup(self, key):
-
-        now = datetime.now(IST)
-
-        if (
-            key in self.last_signal
-            and now - self.last_signal[key]
-            < timedelta(minutes=DUP_MIN)
-        ):
-            return True
-
-        self.last_signal[key] = now
-
-        return False
-
-    # =====================
-
-    def resolve(self, u, s, ot):
-
-        df = self.df[
-            (self.df.name == u)
-            & (
-                self.df.symbol.str.contains(
-                    f"{s}{ot}",
-                    regex=False,
-                )
-            )
-        ]
-
-        if df.empty:
-            raise RuntimeError(
-                f"SCRIP NOT FOUND: {u} {s} {ot}"
-            )
-
-        row = df.sort_values("expiry").iloc[0]
-
-        return (
-            row.symbol,
-            row.token,
-            row.exch_seg,
-        )
-
-    # =====================
-
-    def ltp(self, ex, sym, token):
-
-        r = self.smart.ltpData(
-            ex,
-            sym,
-            token,
-        )
-
-        print(f"LTP: {r}")
-
-        if isinstance(r, str):
-            r = json.loads(r)
-
-        return float(
-            r.get("data", {}).get("ltp")
-        )
-
-    # =====================
-    # REAL ORDER
-    # =====================
-
-    def reset_real_day(self):
-
-        today = datetime.now(IST).date()
-
-        if self.real_trade_day != today:
-            self.real_trade_day = today
-            self.real_entries_today = 0
-
-    # =====================
-
-    def real_entry_block_reason(self, u):
-
-        if not REAL_TRADE_ENABLED:
-            return "REAL_TRADE_ENABLED=false"
-
-        if u not in REAL_ALLOWED_UNDERLYINGS:
-            return f"{u} not in REAL_ALLOWED_UNDERLYINGS"
-
-        self.reset_real_day()
-
-        now = datetime.now(IST).time()
-
-        if now < hhmm(ALLOW_REAL_TRADING_AFTER):
-            return f"before {ALLOW_REAL_TRADING_AFTER}"
-
-        if now > hhmm(STOP_REAL_TRADING_AFTER):
-            return f"after {STOP_REAL_TRADING_AFTER}"
-
-        if self.real_entries_today >= MAX_REAL_TRADES_PER_DAY:
-            return "max real trades reached"
-
-        return None
-
-    # =====================
-
-    def real_price(self, side, ref_price):
-
-        if REAL_ORDER_TYPE == "MARKET":
-            return "0"
-
-        if ref_price is None:
-            raise RuntimeError(
-                "LIMIT order needs reference price"
-            )
-
-        if side == "BUY":
-            price = ref_price + REAL_PRICE_BUFFER
-        else:
-            price = max(
-                0.05,
-                ref_price - REAL_PRICE_BUFFER,
-            )
-
-        return f"{tick(price):.2f}"
-
-    # =====================
-
-    def order_id(self, r):
-
-        if isinstance(r, str):
-
-            text = r.strip()
-
-            if not text:
-                raise RuntimeError(
-                    "EMPTY ORDER RESPONSE"
-                )
-
-            try:
-                r = json.loads(text)
-            except json.JSONDecodeError:
-                return text
-
-        if isinstance(r, (int, float)):
-            return str(r)
-
-        if not isinstance(r, dict):
-            raise RuntimeError(
-                f"BAD ORDER RESPONSE: {r}"
-            )
-
-        if r.get("status") is False:
-            raise RuntimeError(str(r))
-
-        data = r.get("data")
-
-        oid = None
-
-        if isinstance(data, dict):
-            oid = (
-                data.get("orderid")
-                or data.get("order_id")
-                or data.get("uniqueorderid")
-            )
-        elif isinstance(data, str):
-            oid = data
-
-        oid = (
-            oid
-            or r.get("orderid")
-            or r.get("order_id")
-            or r.get("uniqueorderid")
-        )
-
-        if not oid:
-            raise RuntimeError(str(r))
-
-        return str(oid)
-
-    # =====================
-
-    def real_order(self, trade, side, ref_price):
-
-        params = {
-
-            "variety": "NORMAL",
-
-            "tradingsymbol":
-                trade.symbol,
-
-            "symboltoken":
-                trade.token,
-
-            "transactiontype":
-                side,
-
-            "exchange":
-                trade.exchange,
-
-            "ordertype":
-                REAL_ORDER_TYPE,
-
-            "producttype":
-                REAL_PRODUCT_TYPE,
-
-            "duration":
-                "DAY",
-
-            "price":
-                self.real_price(
-                    side,
-                    ref_price,
-                ),
-
-            "quantity":
-                str(trade.qty),
-        }
-
-        err = None
-
-        for i in range(1, 4):
-
-            try:
-
-                print(
-                    f"REAL {side} ORDER {i}: {params}"
-                )
-
-                r = (
-                    self.smart
-                    .placeOrderFullResponse(
-                        params
-                    )
-                )
-
-                print(
-                    f"ORDER RESPONSE: {r}"
-                )
-
-                oid = self.order_id(r)
-
-                print(
-                    f"ORDER SUCCESS: {oid}"
-                )
-
-                return oid
-
-            except Exception as e:
-
-                err = e
-
-                print(
-                    f"ORDER ERROR: {safe(e)}"
-                )
-
-                try:
-                    self.login()
-                except:
-                    pass
-
-                time.sleep(2)
-
-        raise RuntimeError(
-            f"FINAL ORDER FAIL: {safe(err)}"
-        )
-
-    # =====================
-
-    def create_trade(self, u, s, ot):
-
-        sym, token, ex = self.resolve(
-            u,
-            s,
-            ot,
-        )
-
-        price = self.ltp(
-            ex,
-            sym,
-            token,
-        )
-
-        targets = [
-            price + STEP * i
-            for i in range(1, 5)
-        ]
-
-        return Trade(
-            underlying=u,
-            strike=s,
-            option_type=ot,
-
-            symbol=sym,
-            token=token,
-            exchange=ex,
-
-            entry=price,
-            sl=price - STEP,
-            targets=targets,
-
-            qty=LOT_SIZES.get(u, 1),
-        )
-
-    # =====================
-
-    def trail_sl(self, trade):
-
-        if trade.target_hit <= 0:
-            return None
-
-        if trade.target_hit == 1:
-            new_sl = trade.entry
-        else:
-            new_sl = trade.targets[
-                trade.target_hit - 2
-            ]
-
-        if new_sl > trade.sl:
-            old = trade.sl
-            trade.sl = new_sl
-            return old, new_sl
-
-        return None
-
-    # =====================
-
-    def close_trade(self, trade, reason, price):
-
-        msgs = []
-
-        if not trade.real_open:
-            return True, msgs
-
-        if price is None:
-            price = self.ltp(
-                trade.exchange,
-                trade.symbol,
-                trade.token,
-            )
-
-        try:
-
-            oid = self.real_order(
-                trade,
-                "SELL",
-                price,
-            )
-
-            trade.exit_order_id = oid
-            trade.real_open = False
-
-            msgs.append(
-                f"✅ REAL SELL {trade.underlying} "
-                f"{trade.strike} "
-                f"{trade.option_type} "
-                f"@ {price:.2f} "
-                f"({reason}) "
-                f"ORDER: {oid}"
-            )
-
-            return True, msgs
-
-        except Exception as e:
-
-            trade.real_error = safe(e)
-
-            msgs.append(
-                f"⚠️ REAL EXIT FAILED "
-                f"{trade.underlying} "
-                f"{trade.strike} "
-                f"{trade.option_type}: "
-                f"{safe(e)}"
-            )
-
-            return False, msgs
-
-    # =====================
-
-    def signal(self, u, s, ot):
-
-        msgs = []
-
-        key = f"{u}_{s}_{ot}"
-
-        if self.dup(key):
-
-            print("DUP SIGNAL")
-
-            return None, msgs
-
-        active = self.trades.get(u)
-
-        if active:
-
-            if active.option_type == ot:
-                return None, msgs
-
-            ok, exit_msgs = self.close_trade(
-                active,
-                "REVERSE SIGNAL",
-                None,
-            )
-
-            msgs.extend(exit_msgs)
-
-            if not ok:
-                return None, msgs
-
-            msgs.append(
-                f"🔄 {u} OLD "
-                f"{active.strike} "
-                f"{active.option_type} "
-                f"EXITED ON REVERSE SIGNAL"
-            )
-
-            del self.trades[u]
-
-        trade = self.create_trade(
-            u,
-            s,
-            ot,
-        )
-
-        # PAPER TRADE FIRST
-
-        self.trades[u] = trade
-
-        print("PAPER TRADE CREATED")
-
-        # REAL TRADE
-
-        if REAL_TRADE_ENABLED:
-
-            try:
-
-                reason = self.real_entry_block_reason(u)
-
-                if reason:
-                    raise RuntimeError(reason)
-
-                oid = self.real_order(
-                    trade,
-                    "BUY",
-                    trade.entry,
-                )
-
-                trade.order_id = oid
-                trade.real_open = True
-                self.real_entries_today += 1
-
-            except Exception as e:
-
-                trade.real_error = safe(e)
-
-                print(
-                    f"REAL FAIL: {safe(e)}"
-                )
-
-        return trade, msgs
-
-    # =====================
-
-    def update(self):
-
-        msgs = []
-
-        for u, t in list(self.trades.items()):
-
-            try:
-
-                p = self.ltp(
-                    t.exchange,
-                    t.symbol,
-                    t.token,
-                )
-
-                # SL
-
-                if p <= t.sl:
-
-                    msgs.append(
-                        f"❌ {u} SL HIT @ {p:.2f}"
-                    )
-
-                    ok, exit_msgs = self.close_trade(
-                        t,
-                        "SL HIT",
-                        p,
-                    )
-
-                    msgs.extend(exit_msgs)
-
-                    if ok:
-                        del self.trades[u]
-
-                    continue
-
-                # TARGET
-
-                closed = False
-
-                while (
-                    t.target_hit < MAX_TARGET
-                    and p >= t.targets[t.target_hit]
-                ):
-
-                    t.target_hit += 1
-
-                    msgs.append(
-                        f"🎯 {u} "
-                        f"{t.strike} "
-                        f"{t.option_type} "
-                        f"T{t.target_hit} "
-                        f"HIT @ {p:.2f}"
-                    )
-
-                    if t.target_hit >= MAX_TARGET:
-
-                        msgs.append(
-                            f"✅ {u} FINAL TARGET EXIT @ {p:.2f}"
-                        )
-
-                        ok, exit_msgs = self.close_trade(
-                            t,
-                            "FINAL TARGET",
-                            p,
-                        )
-
-                        msgs.extend(exit_msgs)
-
-                        if ok:
-                            del self.trades[u]
-                            closed = True
-
-                        break
-
-                    trail = self.trail_sl(t)
-
-                    if trail:
-
-                        old_sl, new_sl = trail
-
-                        msgs.append(
-                            f"🔁 {u} TRAIL SL "
-                            f"{old_sl:.2f} -> "
-                            f"{new_sl:.2f}"
-                        )
-
-                if closed:
-                    continue
-
-                # PRICE
-
-                if p > t.last_alert:
-
-                    t.last_alert = p
-
-                    msgs.append(
-                        f"📈 {u} "
-                        f"PRICE {p:.2f}"
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"UPDATE ERROR: {safe(e)}"
-                )
-
-        return msgs
-
-# =========================
-# ENGINE
-# =========================
-
-engine = Engine()
-
-# =========================
-# FORMAT
-# =========================
-
-def fmt(t):
-
-    x = [
-        f"🔥 {t.underlying} "
-        f"{t.strike} "
-        f"{t.option_type}",
+    value = value.strip()
+    value = re.sub(
+        r"^https?://t\.me/",
         "",
-        f"Qty: {t.qty}",
-    ]
+        value,
+        flags=re.IGNORECASE
+    ).strip("/")
 
-    if t.order_id:
-        x.append(
-            f"REAL BUY ORDER: {t.order_id}"
-        )
-    elif t.real_error:
-        x.append(
-            f"REAL NOT PLACED: {t.real_error}"
+    return int(value) if re.fullmatch(r"-?\d+", value) else value
+
+
+TARGET_BOT_REF = parse_target_ref(TARGET_BOT_RAW)
+
+
+def _entity_key(value):
+    return re.sub(r"[\s_@]+", "", str(value or "").lower())
+
+
+async def resolve_target_entity(client, target_ref):
+
+    candidates = [target_ref]
+
+    if isinstance(target_ref, str) and not target_ref.startswith("@"):
+        candidates.append(f"@{target_ref}")
+
+    last_error = None
+
+    for candidate in candidates:
+        try:
+            return await client.get_entity(candidate)
+        except Exception as e:
+            last_error = e
+
+    target_key = _entity_key(target_ref)
+
+    async for dialog in client.iter_dialogs():
+
+        entity = dialog.entity
+
+        entity_id = str(getattr(entity, "id", ""))
+
+        full_channel_id = (
+            f"-100{entity_id}"
+            if entity_id and not entity_id.startswith("-")
+            else entity_id
         )
 
-    x.extend(
-        [
-            f"📍 ENTRY: {t.entry:.2f}",
-            f"🛡️ SL: {t.sl:.2f}",
-            f"🎯 T1: {t.targets[0]:.2f}",
-            f"🎯 T2: {t.targets[1]:.2f}",
-            f"🎯 T3: {t.targets[2]:.2f}",
-            f"🎯 T4: {t.targets[3]:.2f}",
+        values = [
+            getattr(entity, "username", None),
+            getattr(entity, "title", None),
+            getattr(entity, "first_name", None),
+            dialog.name,
+            entity_id,
+            full_channel_id,
         ]
+
+        if any(_entity_key(v) == target_key for v in values):
+            return entity
+
+    raise RuntimeError(
+        f"Could not resolve TARGET_BOT={target_ref!r}. "
+        f"Last error: {last_error}"
     )
 
-    return "\n".join(x)
 
-# =========================
-# MONITOR
-# =========================
+def get_atm(price, symbol):
 
-async def monitor():
+    step = STRIKE_STEPS.get(symbol.upper(), 100)
 
-    while True:
+    return int(round(float(price) / step) * step)
 
-        try:
 
-            for m in engine.update():
-                tg(m)
+def risk_points_for(symbol):
 
-        except Exception as e:
+    return (3, 6) if symbol.upper() in STOCK_SYMBOLS else (30, 60)
 
-            print(
-                f"MONITOR ERROR: {safe(e)}"
-            )
 
-        await asyncio.sleep(MONITOR_DELAY)
+def _normalize_cr(value, unit):
 
-# =========================
-# MAIN
-# =========================
+    try:
+        val = float(value)
+
+        if unit == "Cr":
+            return val
+
+        elif unit == "L":
+            return val / 100
+
+        return 0.0
+
+    except:
+        return 0.0
+
+
+def get_writing_values(label, text):
+
+    pattern = (
+        rf"{label}\s+\d+\(([\d.]+)(Cr|L|)\)"
+        rf"\s+\d+\(([\d.]+)(Cr|L|)\)"
+    )
+
+    matches = re.findall(pattern, text, re.IGNORECASE)
+
+    if not matches:
+        return 0.0, 0.0
+
+    itm_val, itm_unit, otm_val, otm_unit = matches[0]
+
+    return (
+        _normalize_cr(itm_val, itm_unit),
+        _normalize_cr(otm_val, otm_unit),
+    )
+
+
+def get_value(label, text):
+
+    pattern = rf"{label}\s*:\s*([\d.]+)(Cr|L|)"
+
+    matches = re.findall(pattern, text, re.IGNORECASE)
+
+    if not matches:
+        return 0.0
+
+    val_str, unit = matches[-1]
+
+    return _normalize_cr(val_str, unit)
+
+
+# ---------------- STRONG FUTURE PRICE PARSER ---------------- #
+
+def get_future_price(text, symbol):
+
+    if not text:
+        return None
+
+    patterns = [
+
+        rf"{re.escape(symbol)}\s*\(FUT:\s*([\d.]+)\)",
+
+        rf"{re.escape(symbol)}\(FUT:\s*([\d.]+)\)",
+
+        rf"{re.escape(symbol)}\s*FUT:\s*([\d.]+)",
+
+        rf"{re.escape(symbol)}.*?FUT:\s*([\d.]+)",
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE | re.DOTALL
+        )
+
+        if match:
+
+            try:
+                return float(match.group(1))
+
+            except:
+                pass
+
+    return None
+
+
+def extract_instrument_section(text, symbol):
+
+    sym_pat = rf"(?<![A-Z0-9_]){re.escape(symbol)}"
+
+    m = re.search(sym_pat, text, re.IGNORECASE)
+
+    if not m:
+        return None
+
+    start = m.start()
+
+    next_pos = [len(text)]
+
+    for sym in WATCH_SYMBOLS:
+
+        if sym == symbol:
+            continue
+
+        m2 = re.search(
+            rf"(?<![A-Z0-9_]){re.escape(sym)}",
+            text[m.end():],
+            re.IGNORECASE
+        )
+
+        if m2:
+            next_pos.append(m.end() + m2.start())
+
+    return text[start:min(next_pos)]
+
+
+def parse_flow_metrics(section):
+
+    if not section:
+        return None
+
+    opt_part = section.split("---- FUTURES FLOW ----")[0]
+
+    c_itm, c_otm = get_writing_values("CALL_WR", opt_part)
+
+    p_itm, p_otm = get_writing_values("PUT_WR", opt_part)
+
+    return {
+
+        "bull_t": get_value("Bullish Turn", opt_part),
+
+        "bear_t": get_value("Bearish Turn", opt_part),
+
+        "call_itm": c_itm,
+        "call_otm": c_otm,
+
+        "put_itm": p_itm,
+        "put_otm": p_otm,
+    }
+
+
+async def safe_send(client, target_id, message):
+
+    try:
+        await client.send_message(target_id, message)
+
+    except Exception as e:
+        print(f"❌ DELIVERY ERROR: {e}", flush=True)
+
+
+# ---------------- MAIN ---------------- #
 
 async def main():
 
-    print("BOT START")
-
-    engine.login()
-    engine.load()
-
     client = TelegramClient(
-        StringSession(TG_SESSION_STR),
-        TG_API_ID,
-        TG_API_HASH,
+        StringSession(SESSION_STR),
+        API_ID,
+        API_HASH
     )
 
     await client.start()
 
+    try:
+
+        target_entity = await resolve_target_entity(
+            client,
+            TARGET_BOT_REF
+        )
+
+        print(
+            f"✅ TARGET_BOT resolved: "
+            f"{getattr(target_entity, 'id', TARGET_BOT_REF)}",
+            flush=True
+        )
+
+    except Exception as e:
+
+        target_entity = TARGET_BOT_REF
+
+        print(f"❌ TARGET_BOT resolve failed: {e}", flush=True)
+
     print(
-        f"LISTENING: {SOURCE_CHAT}"
+        "🚀 SCANNER ACTIVE WITH DEBUG LOGS",
+        flush=True
     )
 
-    @client.on(events.NewMessage())
+    # ---------------- TELEGRAM HANDLER ---------------- #
+
+    @client.on(events.NewMessage(chats=SOURCE_IDS))
     async def handler(event):
 
         try:
 
-            chat = await event.get_chat()
+            text = event.message.text
 
-            text = event.raw_text or ""
+            if not text:
+                return
 
-            # =====================
-            # SOURCE FILTER
-            # =====================
+            print("\n==============================", flush=True)
+            print("📩 NEW MESSAGE RECEIVED", flush=True)
+            print("==============================", flush=True)
 
-            src = str(
-                SOURCE_CHAT
-            ).strip().lower()
+            print(text[:3000], flush=True)
 
-            cands = [
-                str(event.chat_id).lower()
-            ]
+            now = datetime.datetime.now(IST)
 
-            for v in (
-                getattr(chat, "title", None),
-                getattr(chat, "username", None),
-                getattr(chat, "first_name", None),
-            ):
+            # Detect timeframe
 
-                if v:
-                    cands.append(
-                        str(v).strip().lower()
+            if "2 MIN" in text.upper():
+
+                lbl = "2 MIN FLOW"
+                short_lbl = "2MIN"
+
+            elif "5 MIN" in text.upper():
+
+                lbl = "5 MIN FLOW"
+                short_lbl = "5MIN"
+
+            else:
+                return
+
+            # ====================================================
+            # LOOP SYMBOLS
+            # ====================================================
+
+            for symbol in WATCH_SYMBOLS:
+
+                print("\n--------------------------------", flush=True)
+                print(f"🔍 SYMBOL => {symbol}", flush=True)
+
+                section = extract_instrument_section(text, symbol)
+
+                print(
+                    f"SECTION FOUND => {bool(section)}",
+                    flush=True
+                )
+
+                if not section:
+                    continue
+
+                print("\n📌 EXTRACTED SECTION:", flush=True)
+                print(section[:1000], flush=True)
+
+                # ---------------- FUT PRICE ---------------- #
+
+                price = get_future_price(section, symbol)
+
+                print(f"FUT PRICE => {price}", flush=True)
+
+                # SAFETY CHECK
+
+                if not price:
+
+                    print(
+                        f"⚠️ SKIPPED {symbol} => FUT PRICE NOT FOUND",
+                        flush=True
                     )
 
-            if src not in cands:
+                    continue
 
-                print("IGNORE CHAT")
+                strike = get_atm(price, symbol)
 
-                return
+                print(f"ATM STRIKE => {strike}", flush=True)
 
-            print(
-                f"\nVALID MESSAGE:\n{text}\n"
-            )
+                sl, tg = risk_points_for(symbol)
 
-            # =====================
-            # PARSE
-            # =====================
+                # ---------------- FLOW METRICS ---------------- #
 
-            p = engine.parse(text)
+                metrics = parse_flow_metrics(section)
 
-            if not p:
+                print(f"METRICS => {metrics}", flush=True)
 
-                print("NO SIGNAL")
+                if not metrics:
+                    continue
 
-                return
+                # ====================================================
+                # FUTURES LOT LOGIC
+                # ====================================================
 
-            u, s, ot = p
+                fut_match = re.search(
+                    r"(FUT_BUY|FUT_SELL)\s*:\s*(\d+)\s+lots",
+                    section,
+                    re.IGNORECASE
+                )
 
-            print(
-                f"SIGNAL: "
-                f"{u} {s} {ot}"
-            )
+                if fut_match:
 
-            trade, msgs = engine.signal(
-                u,
-                s,
-                ot,
-            )
+                    fut_type = fut_match.group(1).upper()
+                    fut_lots = int(fut_match.group(2))
 
-            for msg in msgs:
-                tg(msg)
+                    print(
+                        f"FUT TYPE => {fut_type} | LOTS => {fut_lots}",
+                        flush=True
+                    )
 
-            if not trade:
-                return
+                    if fut_lots >= FUT_LOT_THRESHOLD:
 
-            tg(fmt(trade))
+                        sig_fut = (
+                            "CALL"
+                            if fut_type == "FUT_BUY"
+                            else "PUT"
+                        )
+
+                        print(
+                            f"✅ FUT SIGNAL DETECTED => {sig_fut}",
+                            flush=True
+                        )
+
+                        if symbol not in last_fut_signals:
+
+                            last_fut_signals[symbol] = {
+                                "2 MIN FLOW": None,
+                                "5 MIN FLOW": None
+                            }
+
+                        last_fut_signals[symbol][lbl] = {
+                            "type": sig_fut,
+                            "time": now
+                        }
+
+                        other_lbl = (
+                            "5 MIN FLOW"
+                            if short_lbl == "2MIN"
+                            else "2 MIN FLOW"
+                        )
+
+                        other = last_fut_signals[symbol].get(other_lbl)
+
+                        if (
+                            other
+                            and other["type"] == sig_fut
+                            and abs(
+                                (
+                                    now - other["time"]
+                                ).total_seconds()
+                            ) <= 30
+                        ):
+
+                            emoji = (
+                                "🟢"
+                                if sig_fut == "CALL"
+                                else "🔴"
+                            )
+
+                            msg = (
+                                f"{emoji} "
+                                f"**INSTITUTIONAL DUAL MATCH** "
+                                f"{emoji}\n\n"
+
+                                f"**ACTION: BUY "
+                                f"{symbol} {strike} "
+                                f"{'CE' if sig_fut == 'CALL' else 'PE'}**\n"
+
+                                f"**SIGNAL: {sig_fut} "
+                                f"(FUT lots >= {FUT_LOT_THRESHOLD})**\n"
+
+                                f"🛡️ **SL: {sl} pts | "
+                                f"🎯 TARGET: {tg} pts**"
+                            )
+
+                            print(
+                                f"🚨 ALERT GENERATED => "
+                                f"{symbol} {strike} {sig_fut}",
+                                flush=True
+                            )
+
+                            await safe_send(
+                                client,
+                                target_entity,
+                                msg
+                            )
+
+                            last_fut_signals[symbol] = {
+                                "2 MIN FLOW": None,
+                                "5 MIN FLOW": None
+                            }
+
+                # ====================================================
+                # ITM WRITER ALERT
+                # ====================================================
+
+                if short_lbl == "2MIN":
+
+                    alert_side = None
+
+                    both_sides_high = (
+
+                        metrics["put_itm"]
+                        >= ITM_WRITER_CONFLICT_CR
+
+                        and
+
+                        metrics["call_itm"]
+                        >= ITM_WRITER_CONFLICT_CR
+                    )
+
+                    if not both_sides_high:
+
+                        if (
+                            metrics["put_itm"]
+                            >= ITM_WRITER_THRESHOLD_CR
+                        ):
+
+                            alert_side = "CALL"
+
+                        elif (
+                            metrics["call_itm"]
+                            >= ITM_WRITER_THRESHOLD_CR
+                        ):
+
+                            alert_side = "PUT"
+
+                    if alert_side:
+
+                        akey = (
+                            f"{symbol}_"
+                            f"{alert_side}_"
+                            f"{now.strftime('%H:%M')}"
+                        )
+
+                        if akey not in instant_itm_alerts:
+
+                            instant_itm_alerts[akey] = now
+
+                            emoji = (
+                                "🟢"
+                                if alert_side == "CALL"
+                                else "🔴"
+                            )
+
+                            msg = (
+                                f"{emoji} "
+                                f"**INSTITUTIONAL DUAL MATCH** "
+                                f"{emoji}\n\n"
+
+                                f"**ACTION: BUY "
+                                f"{symbol} {strike} "
+                                f"{'CE' if alert_side == 'CALL' else 'PE'}**\n"
+
+                                f"**SIGNAL: {alert_side} "
+                                f"(2MIN ITM WRITER >= "
+                                f"{ITM_WRITER_THRESHOLD_CR:g}Cr)**\n"
+
+                                f"🛡️ **SL: {sl} pts | "
+                                f"🎯 TARGET: {tg} pts**"
+                            )
+
+                            print(
+                                f"🚨 ITM WRITER ALERT => "
+                                f"{symbol} {strike} {alert_side}",
+                                flush=True
+                            )
+
+                            await safe_send(
+                                client,
+                                target_entity,
+                                msg
+                            )
+
+                # ====================================================
+                # DUAL FLOW LOGIC
+                # ====================================================
+
+                sig_type = None
+
+                # INDEX LOGIC
+
+                if symbol in ("BANKNIFTY", "NIFTY"):
+
+                    m_turn, m_itm = (
+                        (10.0, 6.5)
+                        if short_lbl == "2MIN"
+                        else (2.0, 1.0)
+                    )
+
+                    if (
+                        metrics["bull_t"] >= m_turn
+                        and metrics["put_itm"] >= m_itm
+                        and metrics["bear_t"] < 1.0
+                    ):
+
+                        sig_type = "CALL"
+
+                    elif (
+                        metrics["bear_t"] >= m_turn
+                        and metrics["call_itm"] >= m_itm
+                        and metrics["bull_t"] < 1.0
+                    ):
+
+                        sig_type = "PUT"
+
+                else:
+
+                    # STOCK LOGIC
+
+                    if short_lbl == "2MIN":
+
+                        if (
+                            metrics["bull_t"] >= 6.0
+                            and metrics["put_itm"] >= 3.5
+                            and metrics["bear_t"] < 1.0
+                        ):
+
+                            sig_type = "CALL"
+
+                        elif (
+                            metrics["bear_t"] >= 6.0
+                            and metrics["call_itm"] >= 3.5
+                            and metrics["bull_t"] < 1.0
+                        ):
+
+                            sig_type = "PUT"
+
+                    else:
+
+                        if (
+                            metrics["bull_t"] >= 1.0
+                            and metrics["put_itm"] < 1.0
+                            and metrics["bear_t"] < 1.0
+                        ):
+
+                            sig_type = "CALL"
+
+                        elif (
+                            metrics["bear_t"] >= 1.0
+                            and metrics["call_itm"] < 1.0
+                            and metrics["bull_t"] < 1.0
+                        ):
+
+                            sig_type = "PUT"
+
+                # ====================================================
+                # FINAL DUAL CONFIRMATION
+                # ====================================================
+
+                if sig_type:
+
+                    print(
+                        f"✅ SIGNAL DETECTED => {sig_type}",
+                        flush=True
+                    )
+
+                    if symbol not in last_signals_by_symbol:
+
+                        last_signals_by_symbol[symbol] = {
+                            "2 MIN FLOW": None,
+                            "5 MIN FLOW": None
+                        }
+
+                    last_signals_by_symbol[symbol][lbl] = {
+                        "type": sig_type,
+                        "time": now
+                    }
+
+                    other_lbl = (
+                        "5 MIN FLOW"
+                        if short_lbl == "2MIN"
+                        else "2 MIN FLOW"
+                    )
+
+                    other = last_signals_by_symbol[symbol].get(other_lbl)
+
+                    if (
+                        other
+                        and other["type"] == sig_type
+                        and abs(
+                            (
+                                now - other["time"]
+                            ).total_seconds()
+                        ) <= 30
+                    ):
+
+                        emoji = (
+                            "🟢"
+                            if sig_type == "CALL"
+                            else "🔴"
+                        )
+
+                        msg = (
+                            f"{emoji} "
+                            f"**INSTITUTIONAL DUAL MATCH** "
+                            f"{emoji}\n\n"
+
+                            f"**ACTION: BUY "
+                            f"{symbol} {strike} "
+                            f"{'CE' if sig_type == 'CALL' else 'PE'}**\n"
+
+                            f"**SIGNAL: {sig_type} "
+                            f"(Matched in "
+                            f"{abs((now-other['time']).total_seconds()):.1f}s)**\n"
+
+                            f"🛡️ **SL: {sl} pts | "
+                            f"🎯 TARGET: {tg} pts**"
+                        )
+
+                        print(
+                            f"🚨 FINAL ALERT => "
+                            f"{symbol} {strike} {sig_type}",
+                            flush=True
+                        )
+
+                        await safe_send(
+                            client,
+                            target_entity,
+                            msg
+                        )
+
+                        last_signals_by_symbol[symbol] = {
+                            "2 MIN FLOW": None,
+                            "5 MIN FLOW": None
+                        }
 
         except Exception as e:
 
             print(
-                f"HANDLER ERROR: {safe(e)}"
+                f"\n❌ HANDLER ERROR => {e}",
+                flush=True
             )
 
-    await asyncio.gather(
-        client.run_until_disconnected(),
-        monitor(),
-    )
+    print("\n🚀 BOT RUNNING...\n", flush=True)
 
-# =========================
-# START
-# =========================
+    await client.run_until_disconnected()
+
+
+# ---------------- START ---------------- #
 
 if __name__ == "__main__":
 
