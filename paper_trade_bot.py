@@ -915,28 +915,13 @@ def fmt(t):
         f"{t.strike} "
         f"{t.option_type}",
         "",
-        f"Qty: {t.qty}",
+        f"📍 ENTRY: {t.entry:.2f}",
+        f"🛡️ SL: {t.sl:.2f}",
+        f"🎯 T1: {t.targets[0]:.2f}",
+        f"🎯 T2: {t.targets[1]:.2f}",
+        f"🎯 T3: {t.targets[2]:.2f}",
+        f"🎯 T4: {t.targets[3]:.2f}",
     ]
-
-    if t.order_id:
-        x.append(
-            f"REAL BUY ORDER: {t.order_id}"
-        )
-    elif t.real_error:
-        x.append(
-            f"REAL NOT PLACED: {t.real_error}"
-        )
-
-    x.extend(
-        [
-            f"📍 ENTRY: {t.entry:.2f}",
-            f"🛡️ SL: {t.sl:.2f}",
-            f"🎯 T1: {t.targets[0]:.2f}",
-            f"🎯 T2: {t.targets[1]:.2f}",
-            f"🎯 T3: {t.targets[2]:.2f}",
-            f"🎯 T4: {t.targets[3]:.2f}",
-        ]
-    )
 
     return "\n".join(x)
 
