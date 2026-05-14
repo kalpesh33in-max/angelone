@@ -120,7 +120,7 @@ LOT_SIZES = {
 # =========================
 
 STEP = 30
-MAX_TARGET = 4
+MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
 
@@ -156,6 +156,9 @@ def hhmm(v):
 
 def tick(v):
     return round(round(float(v) / 0.05) * 0.05, 2)
+
+def trade_step(underlying):
+    return 15 if underlying == "NIFTY" else STEP
 
 def tg(text):
 
@@ -610,9 +613,10 @@ class Engine:
             token,
         )
 
+        step = trade_step(u)
         targets = [
-            price + STEP * i
-            for i in range(1, 5)
+            price + step * i
+            for i in range(1, MAX_TARGET + 1)
         ]
 
         return Trade(
@@ -625,7 +629,7 @@ class Engine:
             exchange=ex,
 
             entry=price,
-            sl=price - STEP,
+            sl=price - step,
             targets=targets,
 
             qty=LOT_SIZES.get(u, 1),
@@ -716,6 +720,12 @@ class Engine:
 
             print("DUP SIGNAL")
 
+            msgs.append(
+                f"🚀💥 {u} {s} {ot} "
+                f"SAME DIRECTION REPEAT SIGNAL\n"
+                f"READY TO FLY / STRONG MOVEMENT"
+            )
+
             return None, msgs
 
         active = self.trades.get(u)
@@ -723,6 +733,12 @@ class Engine:
         if active:
 
             if active.option_type == ot:
+                msgs.append(
+                    f"🚀💥 {u} SAME DIRECTION SIGNAL AGAIN\n"
+                    f"ACTIVE: {active.strike} {active.option_type} | "
+                    f"NEW: {s} {ot}\n"
+                    f"READY TO FLY / STRONG MOVEMENT"
+                )
                 return None, msgs
 
             ok, exit_msgs = self.close_trade(
@@ -836,23 +852,20 @@ class Engine:
 
                     t.target_hit += 1
 
-                    msgs.append(
-                        f"🎯 {u} "
-                        f"{t.strike} "
-                        f"{t.option_type} "
-                        f"T{t.target_hit} "
-                        f"HIT @ {p:.2f}"
-                    )
-
                     if t.target_hit >= MAX_TARGET:
 
                         msgs.append(
-                            f"✅ {u} FINAL TARGET EXIT @ {p:.2f}"
+                            f"✅ {u} "
+                            f"{t.strike} "
+                            f"{t.option_type} "
+                            f"T{t.target_hit} REACHED - "
+                            f"BOOK ALL @ {p:.2f} "
+                            f"(NO TRAIL NOW)"
                         )
 
                         ok, exit_msgs = self.close_trade(
                             t,
-                            "FINAL TARGET",
+                            "T5 BOOK ALL",
                             p,
                         )
 
@@ -871,7 +884,11 @@ class Engine:
                         old_sl, new_sl = trail
 
                         msgs.append(
-                            f"🔁 {u} TRAIL SL "
+                            f"🎯 {u} "
+                            f"{t.strike} "
+                            f"{t.option_type} "
+                            f"T{t.target_hit} REACHED - "
+                            f"BOOK PROFIT OR TRAIL SL "
                             f"{old_sl:.2f} -> "
                             f"{new_sl:.2f}"
                         )
@@ -921,6 +938,7 @@ def fmt(t):
         f"🎯 T2: {t.targets[1]:.2f}",
         f"🎯 T3: {t.targets[2]:.2f}",
         f"🎯 T4: {t.targets[3]:.2f}",
+        f"🎯 T5: {t.targets[4]:.2f}",
     ]
 
     return "\n".join(x)

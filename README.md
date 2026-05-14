@@ -65,6 +65,7 @@ Entry:
 🎯 T2: 643.60
 🎯 T3: 673.60
 🎯 T4: 703.60
+🎯 T5: 733.60
 ```
 
 Price update:
@@ -127,18 +128,21 @@ python paper_trade_bot.py
 - Reads only `INSTITUTIONAL DUAL MATCH` style alerts from the source chat.
 - Extracts `ACTION: BUY <symbol> <strike> CE/PE`.
 - Opens one active trade per allowed underlying.
-- Duplicate same signal is blocked for 10 minutes.
+- Duplicate same signal is blocked from opening a new trade for 10 minutes, but sends a same-direction strong movement alert.
 - Reverse signal exits the old trade and opens the new one.
 - Entry is live Angel One LTP.
-- Index SL is `entry - 30`.
-- Index targets are `entry + 30`, `+60`, `+90`, `+120`.
+- BANKNIFTY SL is `entry - 30`.
+- BANKNIFTY targets are `entry + 30`, `+60`, `+90`, `+120`, `+150`.
+- NIFTY SL is `entry - 15`.
+- NIFTY targets are `entry + 15`, `+30`, `+45`, `+60`, `+75`.
 - Stock SL is `entry - 3`.
 - Stock targets are `entry + 3`, `+6`, `+9`, `+12`.
 - Monitor loop runs every 3 seconds.
 - Real trade entry uses the same signal as paper trade.
 - Real trade exit follows the paper trade lifecycle: SL hit, reverse signal, or final target.
-- Trailing SL is virtual in the bot: after T1 SL moves to entry, after T2 SL moves to T1, after T3 SL moves to T2.
-- T4 is treated as final target exit.
+- Trailing SL is virtual in the bot: after T1 SL moves to entry, after T2 SL moves to T1, after T3 SL moves to T2, after T4 SL moves to T3.
+- T1 to T4 alerts say `BOOK PROFIT OR TRAIL SL old -> new`.
+- T5 is treated as final target exit and alerts `BOOK ALL`.
 - By default real trading is OFF. Set `REAL_TRADE_ENABLED=true` only when you want live Angel One orders.
 - Current real-trade scope is only `NIFTY` and `BANKNIFTY`.
 - Real quantity is one lot: `NIFTY=65`, `BANKNIFTY=30`.
