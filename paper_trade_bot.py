@@ -151,6 +151,35 @@ def safe(e):
     except:
         return type(e).__name__
 
+def parse_api_response(r):
+    if isinstance(r, str):
+        r = json.loads(r)
+
+    if not isinstance(r, dict):
+        raise RuntimeError(
+            f"BAD API RESPONSE: {r}"
+        )
+
+    return r
+
+def api_error(r):
+    msg = (
+        r.get("message")
+        or r.get("errorCode")
+        or r.get("errorcode")
+        or "unknown error"
+    )
+    code = (
+        r.get("errorCode")
+        or r.get("errorcode")
+        or r.get("code")
+    )
+
+    if code and str(code) not in str(msg):
+        return f"{msg} ({code})"
+
+    return str(msg)
+
 def hhmm(v):
     return datetime.strptime(v, "%H:%M").time()
 
@@ -240,11 +269,20 @@ class Engine:
             ANGEL_TOTP_SECRET
         ).now()
 
-        self.smart.generateSession(
+        r = self.smart.generateSession(
             ANGEL_CLIENT_ID,
             ANGEL_PASSWORD,
             totp,
         )
+
+        r = parse_api_response(r)
+
+        if r.get("status") is False:
+            raise RuntimeError(
+                f"ANGEL LOGIN FAILED: {api_error(r)}"
+            )
+
+        print("ANGEL LOGIN OK")
 
     # =====================
 
@@ -382,19 +420,57 @@ class Engine:
 
     def ltp(self, ex, sym, token):
 
-        r = self.smart.ltpData(
-            ex,
-            sym,
-            token,
-        )
+        last = None
 
-        print(f"LTP: {r}")
+        for attempt in range(1, 3):
 
-        if isinstance(r, str):
-            r = json.loads(r)
+            r = self.smart.ltpData(
+                ex,
+                sym,
+                token,
+            )
 
-        return float(
-            r.get("data", {}).get("ltp")
+            print(f"LTP: {r}")
+
+            r = parse_api_response(r)
+            last = r
+
+            if r.get("success") is False or r.get("status") is False:
+                err = api_error(r)
+
+                if (
+                    attempt == 1
+                    and (
+                        r.get("errorCode") == "AG8001"
+                        or "invalid token" in err.lower()
+                    )
+                ):
+                    print("LTP TOKEN ERROR - RELOGIN")
+                    self.login()
+                    continue
+
+                raise RuntimeError(
+                    f"LTP FAILED: {err}"
+                )
+
+            data = r.get("data")
+
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    f"LTP FAILED: bad data: {data}"
+                )
+
+            ltp = data.get("ltp")
+
+            if ltp is None:
+                raise RuntimeError(
+                    f"LTP FAILED: missing ltp: {r}"
+                )
+
+            return float(ltp)
+
+        raise RuntimeError(
+            f"LTP FAILED: {last}"
         )
 
     # =====================
@@ -972,8 +1048,17 @@ async def main():
 
     print("BOT START")
 
-    engine.login()
-    engine.load()
+    try:
+        engine.login()
+        engine.load()
+    except Exception as e:
+        print(
+            f"STARTUP ERROR: {safe(e)}"
+        )
+        tg(
+            f"BOT STARTUP ERROR: {safe(e)}"
+        )
+        raise
 
     client = TelegramClient(
         StringSession(TG_SESSION_STR),
@@ -989,6 +1074,8 @@ async def main():
 
     @client.on(events.NewMessage())
     async def handler(event):
+
+        signal_desc = None
 
         try:
 
@@ -1048,6 +1135,8 @@ async def main():
                 f"{u} {s} {ot}"
             )
 
+            signal_desc = f"{u} {s} {ot}"
+
             trade, msgs = engine.signal(
                 u,
                 s,
@@ -1067,6 +1156,12 @@ async def main():
             print(
                 f"HANDLER ERROR: {safe(e)}"
             )
+
+            if signal_desc:
+                tg(
+                    f"BOT ERROR AFTER SIGNAL "
+                    f"{signal_desc}: {safe(e)}"
+                )
 
     await asyncio.gather(
         client.run_until_disconnected(),
