@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -123,6 +123,12 @@ STEP = 30
 MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
+REVERSE_SCRATCH_SECONDS = env_int("REVERSE_SCRATCH_SECONDS", "180")
+
+REVERSE_PROTECT_POINTS = {
+    "NIFTY": env_float("NIFTY_REVERSE_PROTECT_POINTS", "5"),
+    "BANKNIFTY": env_float("BANKNIFTY_REVERSE_PROTECT_POINTS", "10"),
+}
 
 MASTER_FILE = "OpenAPIScripMaster.json"
 
@@ -238,6 +244,11 @@ class Trade:
 
     target_hit: int = 0
     last_alert: float = 0
+    is_reverse: bool = False
+    opened_at: datetime = field(
+        default_factory=lambda: datetime.now(IST)
+    )
+    reverse_protected: bool = False
 
 # =========================
 # ENGINE
@@ -371,6 +382,76 @@ class Engine:
             )
 
         return valid[-1] if valid else None
+
+    # =====================
+
+    def parse_exit(self, text):
+
+        up = text.upper()
+
+        pat = "|".join(
+            sorted(
+                SUPPORTED,
+                key=len,
+                reverse=True,
+            )
+        )
+
+        m = re.search(
+            rf"ACTION:\s*EXIT\s+({pat})\b",
+            up,
+        )
+
+        if not m:
+            return None
+
+        pending = None
+
+        pm = re.search(
+            rf"PENDING:\s*BUY\s+({pat})\s+(\d{{4,6}})\s*(CE|PE)",
+            up,
+        )
+
+        if pm:
+            pending = (
+                pm.group(1),
+                int(pm.group(2)),
+                pm.group(3),
+            )
+
+        return m.group(1), pending
+
+    # =====================
+
+    def parse_cancel(self, text):
+
+        up = text.upper()
+
+        if "REVERSE CANCELLED" not in up:
+            return None
+
+        pat = "|".join(
+            sorted(
+                SUPPORTED,
+                key=len,
+                reverse=True,
+            )
+        )
+
+        pm = re.search(
+            rf"PENDING:\s*BUY\s+({pat})\s+(\d{{4,6}})\s*(CE|PE)",
+            up,
+        )
+
+        if not pm:
+            return "🚫 REVERSE CANCELLED"
+
+        return (
+            "🚫 REVERSE CANCELLED\n\n"
+            f"PENDING: BUY {pm.group(1)} "
+            f"{int(pm.group(2))} {pm.group(3)}\n"
+            "REASON: NEXT 2MIN FLOW NOT CONFIRMED"
+        )
 
     # =====================
 
@@ -675,7 +756,7 @@ class Engine:
 
     # =====================
 
-    def create_trade(self, u, s, ot):
+    def create_trade(self, u, s, ot, is_reverse=False):
 
         sym, token, ex = self.resolve(
             u,
@@ -709,6 +790,7 @@ class Engine:
             targets=targets,
 
             qty=LOT_SIZES.get(u, 1),
+            is_reverse=is_reverse,
         )
 
     # =====================
@@ -786,7 +868,56 @@ class Engine:
 
     # =====================
 
-    def signal(self, u, s, ot):
+    def exit_only(self, u, pending):
+
+        msgs = []
+        active = self.trades.get(u)
+
+        if active:
+
+            ok, exit_msgs = self.close_trade(
+                active,
+                "REVERSE EXIT ONLY",
+                None,
+            )
+
+            msgs.extend(exit_msgs)
+
+            if not ok:
+                return msgs
+
+            msgs.append(
+                f"🔄 {u} OLD "
+                f"{active.strike} "
+                f"{active.option_type} "
+                f"EXITED\n"
+                f"REASON: REVERSE EXIT ONLY"
+            )
+
+            del self.trades[u]
+
+        else:
+
+            msgs.append(
+                f"⚠️ {u} REVERSE EXIT ONLY\n"
+                f"NO ACTIVE TRADE"
+            )
+
+        if pending:
+
+            pu, ps, pot = pending
+
+            msgs.append(
+                f"⏳ PENDING: BUY {pu} "
+                f"{ps} {pot}\n"
+                f"WAIT: NEXT 2MIN CONFIRMATION"
+            )
+
+        return msgs
+
+    # =====================
+
+    def signal(self, u, s, ot, reverse_confirmed=False):
 
         msgs = []
 
@@ -841,6 +972,7 @@ class Engine:
             u,
             s,
             ot,
+            reverse_confirmed,
         )
 
         # PAPER TRADE FIRST
@@ -972,6 +1104,57 @@ class Engine:
                 if closed:
                     continue
 
+                # REVERSE PROTECTION
+
+                if t.is_reverse and t.target_hit == 0:
+
+                    protect = REVERSE_PROTECT_POINTS.get(
+                        u,
+                        trade_step(u),
+                    )
+
+                    if (
+                        not t.reverse_protected
+                        and p >= t.entry + protect
+                    ):
+
+                        old_sl = t.sl
+                        t.sl = max(t.sl, t.entry)
+                        t.reverse_protected = True
+
+                        msgs.append(
+                            f"🛡️ {u} REVERSE PROTECT\n"
+                            f"PRICE: {p:.2f}\n"
+                            f"SL MOVED: {old_sl:.2f} -> "
+                            f"{t.sl:.2f}"
+                        )
+
+                    if (
+                        datetime.now(IST) - t.opened_at
+                        >= timedelta(
+                            seconds=REVERSE_SCRATCH_SECONDS
+                        )
+                    ):
+
+                        msgs.append(
+                            f"⚠️ {u} REVERSE SCRATCH EXIT\n\n"
+                            f"NO T1 IN 3 MINUTES\n"
+                            f"EXIT @ {p:.2f}"
+                        )
+
+                        ok, exit_msgs = self.close_trade(
+                            t,
+                            "REVERSE NO T1 3 MIN",
+                            p,
+                        )
+
+                        msgs.extend(exit_msgs)
+
+                        if ok:
+                            del self.trades[u]
+
+                        continue
+
                 # PRICE
 
                 if p > t.last_alert:
@@ -1016,6 +1199,14 @@ def fmt(t):
         f"🎯 T4: {t.targets[3]:.2f}",
         f"🎯 T5: {t.targets[4]:.2f}",
     ]
+
+    if t.is_reverse:
+        x.extend(
+            [
+                "",
+                "✅ REVERSE CONFIRMED NEXT 2MIN",
+            ]
+        )
 
     return "\n".join(x)
 
@@ -1120,6 +1311,27 @@ async def main():
             # PARSE
             # =====================
 
+            cancel_msg = engine.parse_cancel(text)
+
+            if cancel_msg:
+                tg(cancel_msg)
+                return
+
+            exit_req = engine.parse_exit(text)
+
+            if exit_req:
+
+                u, pending = exit_req
+                signal_desc = f"EXIT {u}"
+
+                for msg in engine.exit_only(
+                    u,
+                    pending,
+                ):
+                    tg(msg)
+
+                return
+
             p = engine.parse(text)
 
             if not p:
@@ -1136,11 +1348,15 @@ async def main():
             )
 
             signal_desc = f"{u} {s} {ot}"
+            reverse_confirmed = (
+                "REVERSE CONFIRMED" in text.upper()
+            )
 
             trade, msgs = engine.signal(
                 u,
                 s,
                 ot,
+                reverse_confirmed,
             )
 
             for msg in msgs:
