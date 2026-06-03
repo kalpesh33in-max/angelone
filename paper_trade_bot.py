@@ -921,21 +921,8 @@ class Engine:
 
         msgs = []
 
-        key = f"{u}_{s}_{ot}"
-
-        if self.dup(key):
-
-            print("DUP SIGNAL")
-
-            msgs.append(
-                f"🚀💥 {u} {s} {ot} "
-                f"SAME DIRECTION REPEAT SIGNAL\n"
-                f"READY TO FLY / STRONG MOVEMENT"
-            )
-
-            return None, msgs
-
         active = self.trades.get(u)
+        active_opposite = False
 
         if active:
 
@@ -948,9 +935,15 @@ class Engine:
                 )
                 return None, msgs
 
+            active_opposite = True
+
             ok, exit_msgs = self.close_trade(
                 active,
-                "REVERSE SIGNAL",
+                (
+                    "REVERSE CONFIRMED OLD EXIT"
+                    if reverse_confirmed
+                    else "REVERSE EXIT ONLY"
+                ),
                 None,
             )
 
@@ -963,10 +956,32 @@ class Engine:
                 f"🔄 {u} OLD "
                 f"{active.strike} "
                 f"{active.option_type} "
-                f"EXITED ON REVERSE SIGNAL"
+                f"EXITED ON "
+                f"{'REVERSE CONFIRMED' if reverse_confirmed else 'REVERSE EXIT ONLY'}"
             )
 
             del self.trades[u]
+
+            if not reverse_confirmed:
+                msgs.append(
+                    f"⏳ PENDING: BUY {u} {s} {ot}\n"
+                    f"WAIT: NEXT 2MIN CONFIRMATION"
+                )
+                return None, msgs
+
+        key = f"{u}_{s}_{ot}"
+
+        if not active_opposite and self.dup(key):
+
+            print("DUP SIGNAL")
+
+            msgs.append(
+                f"🚀💥 {u} {s} {ot} "
+                f"SAME DIRECTION REPEAT SIGNAL\n"
+                f"READY TO FLY / STRONG MOVEMENT"
+            )
+
+            return None, msgs
 
         trade = self.create_trade(
             u,
@@ -1134,6 +1149,7 @@ class Engine:
                         >= timedelta(
                             seconds=REVERSE_SCRATCH_SECONDS
                         )
+                        and p < t.targets[0]
                     ):
 
                         msgs.append(
