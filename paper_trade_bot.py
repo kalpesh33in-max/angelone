@@ -345,7 +345,13 @@ class Engine:
 
         up = text.upper()
 
-        if "INSTITUTIONAL DUAL MATCH" not in up:
+        if "WATCH" in up:
+            return None
+
+        if (
+            "INSTITUTIONAL DUAL MATCH" not in up
+            and "INSTITUTIONAL FULL" not in up
+        ):
             return None
 
         pat = "|".join(
@@ -1366,6 +1372,7 @@ async def main():
             signal_desc = f"{u} {s} {ot}"
             reverse_confirmed = (
                 "REVERSE CONFIRMED" in text.upper()
+                or "FULL OPPOSITE" in text.upper()
             )
 
             trade, msgs = engine.signal(
