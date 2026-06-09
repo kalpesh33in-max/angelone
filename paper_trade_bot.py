@@ -110,6 +110,11 @@ REAL_ALLOWED_UNDERLYINGS = env_csv(
     "NIFTY,BANKNIFTY",
 )
 
+OPPOSITE_TRADE_MODE = env_bool(
+    "OPPOSITE_TRADE_MODE",
+    "true",
+)
+
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
     "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
@@ -194,6 +199,12 @@ def tick(v):
 
 def trade_step(underlying):
     return 15 if underlying == "NIFTY" else STEP
+
+def trade_option_type(option_type):
+    if not OPPOSITE_TRADE_MODE:
+        return option_type
+
+    return "PE" if option_type == "CE" else "CE"
 
 def tg(text):
 
@@ -381,7 +392,7 @@ class Engine:
                 (
                     sym,
                     strike,
-                    ot,
+                    trade_option_type(ot),
                 )
             )
 
@@ -440,7 +451,7 @@ class Engine:
             pending = (
                 pm.group(1),
                 int(pm.group(2)),
-                pm.group(3),
+                trade_option_type(pm.group(3)),
             )
 
         return m.group(1), pending
@@ -473,7 +484,7 @@ class Engine:
         return (
             "🚫 REVERSE CANCELLED\n\n"
             f"PENDING: BUY {pm.group(1)} "
-            f"{int(pm.group(2))} {pm.group(3)}\n"
+            f"{int(pm.group(2))} {trade_option_type(pm.group(3))}\n"
             "REASON: NEXT 2MIN FLOW NOT CONFIRMED"
         )
 

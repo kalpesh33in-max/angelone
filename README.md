@@ -51,6 +51,7 @@ ACTION: BUY RELIANCE <strike> CE/PE
 
 Notes:
 - `2 MIN OPTION FLOW ALERT` messages are treated as informational and are ignored by this bot (no `ACTION: BUY ...` line).
+- `OPPOSITE_TRADE_MODE=true` makes the bot trade the opposite option side: source `CE` opens `PE`, and source `PE` opens `CE`.
 
 ## Output Messages
 
@@ -105,6 +106,7 @@ ALLOW_REAL_TRADING_AFTER=09:20
 STOP_REAL_TRADING_AFTER=15:10
 TRADE_UNDERLYINGS=NIFTY,BANKNIFTY
 REAL_ALLOWED_UNDERLYINGS=NIFTY,BANKNIFTY
+OPPOSITE_TRADE_MODE=true
 NIFTY_LOT_SIZE=65
 BANKNIFTY_LOT_SIZE=30
 KEEPALIVE_ENABLED=true
@@ -127,6 +129,7 @@ python paper_trade_bot.py
 
 - Reads only `INSTITUTIONAL DUAL MATCH` style alerts from the source chat.
 - Extracts `ACTION: BUY <symbol> <strike> CE/PE`.
+- When `OPPOSITE_TRADE_MODE=true`, flips the extracted option side before entry: `CE -> PE`, `PE -> CE`.
 - Opens one active trade per allowed underlying.
 - Duplicate same signal is blocked from opening a new trade for 10 minutes, but sends a same-direction strong movement alert.
 - Reverse signal exits the old trade and opens the new one.
