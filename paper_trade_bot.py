@@ -245,6 +245,7 @@ class Trade:
     target_hit: int = 0
     last_alert: float = 0
     is_reverse: bool = False
+    signal_source: str | None = None
     opened_at: datetime = field(
         default_factory=lambda: datetime.now(IST)
     )
@@ -348,10 +349,7 @@ class Engine:
         if "WATCH" in up:
             return None
 
-        if (
-            "INSTITUTIONAL DUAL MATCH" not in up
-            and "INSTITUTIONAL FULL" not in up
-        ):
+        if not self.signal_source(text):
             return None
 
         pat = "|".join(
@@ -388,6 +386,26 @@ class Engine:
             )
 
         return valid[-1] if valid else None
+
+    # =====================
+
+    def signal_source(self, text):
+
+        up = text.upper()
+
+        if "FULL 2MIN ITM WRITING" in up:
+            return "FULL 2MIN ITM WRITING"
+
+        if "FULL 2MIN OPTION+FUTURE" in up:
+            return "FULL 2MIN OPTION+FUTURE"
+
+        if "INSTITUTIONAL FULL" in up:
+            return "INSTITUTIONAL FULL"
+
+        if "INSTITUTIONAL DUAL MATCH" in up:
+            return "INSTITUTIONAL DUAL MATCH"
+
+        return None
 
     # =====================
 
@@ -762,7 +780,14 @@ class Engine:
 
     # =====================
 
-    def create_trade(self, u, s, ot, is_reverse=False):
+    def create_trade(
+        self,
+        u,
+        s,
+        ot,
+        is_reverse=False,
+        signal_source=None,
+    ):
 
         sym, token, ex = self.resolve(
             u,
@@ -797,6 +822,7 @@ class Engine:
 
             qty=LOT_SIZES.get(u, 1),
             is_reverse=is_reverse,
+            signal_source=signal_source,
         )
 
     # =====================
@@ -923,7 +949,14 @@ class Engine:
 
     # =====================
 
-    def signal(self, u, s, ot, reverse_confirmed=False):
+    def signal(
+        self,
+        u,
+        s,
+        ot,
+        reverse_confirmed=False,
+        signal_source=None,
+    ):
 
         msgs = []
 
@@ -994,6 +1027,7 @@ class Engine:
             s,
             ot,
             reverse_confirmed,
+            signal_source,
         )
 
         # PAPER TRADE FIRST
@@ -1230,6 +1264,14 @@ def fmt(t):
             ]
         )
 
+    if t.signal_source:
+        x.extend(
+            [
+                "",
+                f"SIGNAL SOURCE: {t.signal_source}",
+            ]
+        )
+
     return "\n".join(x)
 
 # =========================
@@ -1363,13 +1405,15 @@ async def main():
                 return
 
             u, s, ot = p
+            source = engine.signal_source(text)
 
             print(
                 f"SIGNAL: "
-                f"{u} {s} {ot}"
+                f"{u} {s} {ot} "
+                f"({source})"
             )
 
-            signal_desc = f"{u} {s} {ot}"
+            signal_desc = f"{u} {s} {ot} ({source})"
             reverse_confirmed = (
                 "REVERSE CONFIRMED" in text.upper()
                 or "FULL OPPOSITE" in text.upper()
@@ -1380,6 +1424,7 @@ async def main():
                 s,
                 ot,
                 reverse_confirmed,
+                source,
             )
 
             for msg in msgs:
