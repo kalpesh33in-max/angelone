@@ -110,11 +110,6 @@ REAL_ALLOWED_UNDERLYINGS = env_csv(
     "NIFTY,BANKNIFTY",
 )
 
-OPPOSITE_TRADE_MODE = env_bool(
-    "OPPOSITE_TRADE_MODE",
-    "true",
-)
-
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
     "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
@@ -201,10 +196,7 @@ def trade_step(underlying):
     return 15 if underlying == "NIFTY" else STEP
 
 def trade_option_type(option_type):
-    if not OPPOSITE_TRADE_MODE:
-        return option_type
-
-    return "PE" if option_type == "CE" else "CE"
+    return option_type
 
 def tg(text):
 
@@ -403,6 +395,9 @@ class Engine:
     def signal_source(self, text):
 
         up = text.upper()
+
+        if "FULL 2MIN FAST ITM WRITING" in up:
+            return "FULL 2MIN FAST ITM WRITING"
 
         if "FULL 2MIN ITM WRITING" in up:
             return "FULL 2MIN ITM WRITING"
