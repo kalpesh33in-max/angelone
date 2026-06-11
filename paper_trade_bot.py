@@ -105,6 +105,16 @@ STOP_REAL_TRADING_AFTER = env(
     "15:10",
 )
 
+PAPER_TRADE_START_TIME = env(
+    "PAPER_TRADE_START_TIME",
+    "09:19",
+)
+
+PAPER_TRADE_STOP_TIME = env(
+    "PAPER_TRADE_STOP_TIME",
+    "15:00",
+)
+
 REAL_ALLOWED_UNDERLYINGS = env_csv(
     "REAL_ALLOWED_UNDERLYINGS",
     "NIFTY,BANKNIFTY",
@@ -123,7 +133,7 @@ STEP = 30
 MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
-REVERSE_SCRATCH_SECONDS = env_int("REVERSE_SCRATCH_SECONDS", "180")
+NO_T1_EXIT_SECONDS = env_int("NO_T1_EXIT_SECONDS", "240")
 
 REVERSE_PROTECT_POINTS = {
     "NIFTY": env_float("NIFTY_REVERSE_PROTECT_POINTS", "5"),
@@ -623,6 +633,20 @@ class Engine:
 
     # =====================
 
+    def paper_entry_block_reason(self):
+
+        now = datetime.now(IST).time()
+
+        if now < hhmm(PAPER_TRADE_START_TIME):
+            return f"before {PAPER_TRADE_START_TIME}"
+
+        if now >= hhmm(PAPER_TRADE_STOP_TIME):
+            return f"after {PAPER_TRADE_STOP_TIME}"
+
+        return None
+
+    # =====================
+
     def real_price(self, side, ref_price):
 
         if REAL_ORDER_TYPE == "MARKET":
@@ -965,6 +989,7 @@ class Engine:
     ):
 
         msgs = []
+        entry_block_reason = self.paper_entry_block_reason()
 
         active = self.trades.get(u)
         active_opposite = False
@@ -1014,7 +1039,23 @@ class Engine:
                 )
                 return None, msgs
 
+            if entry_block_reason:
+                msgs.append(
+                    f"⏱️ PAPER ENTRY BLOCKED\n"
+                    f"{u} {s} {ot}\n"
+                    f"REASON: {entry_block_reason}"
+                )
+                return None, msgs
+
         key = f"{u}_{s}_{ot}"
+
+        if entry_block_reason:
+            msgs.append(
+                f"⏱️ PAPER ENTRY BLOCKED\n"
+                f"{u} {s} {ot}\n"
+                f"REASON: {entry_block_reason}"
+            )
+            return None, msgs
 
         if not active_opposite and self.dup(key):
 
@@ -1078,6 +1119,52 @@ class Engine:
     def update(self):
 
         msgs = []
+
+        if (
+            datetime.now(IST).time()
+            >= hhmm(PAPER_TRADE_STOP_TIME)
+            and self.trades
+        ):
+
+            for u, t in list(self.trades.items()):
+
+                try:
+                    p = self.ltp(
+                        t.exchange,
+                        t.symbol,
+                        t.token,
+                    )
+                    msgs.append(
+                        f"⏰ {u} PAPER CUTOFF EXIT\n"
+                        f"TIME: {PAPER_TRADE_STOP_TIME}\n"
+                        f"EXIT @ {p:.2f}"
+                    )
+                except Exception as e:
+                    p = None
+                    msgs.append(
+                        f"⏰ {u} PAPER CUTOFF EXIT\n"
+                        f"TIME: {PAPER_TRADE_STOP_TIME}\n"
+                        f"LTP ERROR: {safe(e)}"
+                    )
+
+                try:
+                    ok, exit_msgs = self.close_trade(
+                        t,
+                        f"PAPER CUTOFF {PAPER_TRADE_STOP_TIME}",
+                        p,
+                    )
+
+                    msgs.extend(exit_msgs)
+
+                    if ok:
+                        del self.trades[u]
+
+                except Exception as e:
+                    msgs.append(
+                        f"⚠️ {u} PAPER CUTOFF EXIT FAILED: {safe(e)}"
+                    )
+
+            return msgs
 
         for u, t in list(self.trades.items()):
 
@@ -1190,32 +1277,33 @@ class Engine:
                             f"{t.sl:.2f}"
                         )
 
-                    if (
-                        datetime.now(IST) - t.opened_at
-                        >= timedelta(
-                            seconds=REVERSE_SCRATCH_SECONDS
-                        )
-                        and p < t.targets[0]
-                    ):
+                # TIME EXIT: if T1 is not reached within 4 minutes, close.
 
-                        msgs.append(
-                            f"⚠️ {u} REVERSE SCRATCH EXIT\n\n"
-                            f"NO T1 IN 3 MINUTES\n"
-                            f"EXIT @ {p:.2f}"
-                        )
+                if (
+                    t.target_hit == 0
+                    and datetime.now(IST) - t.opened_at
+                    >= timedelta(seconds=NO_T1_EXIT_SECONDS)
+                    and p < t.targets[0]
+                ):
 
-                        ok, exit_msgs = self.close_trade(
-                            t,
-                            "REVERSE NO T1 3 MIN",
-                            p,
-                        )
+                    msgs.append(
+                        f"⚠️ {u} NO T1 EXIT\n\n"
+                        f"NO T1 IN 4 MINUTES\n"
+                        f"EXIT @ {p:.2f}"
+                    )
 
-                        msgs.extend(exit_msgs)
+                    ok, exit_msgs = self.close_trade(
+                        t,
+                        "NO T1 4 MIN",
+                        p,
+                    )
 
-                        if ok:
-                            del self.trades[u]
+                    msgs.extend(exit_msgs)
 
-                        continue
+                    if ok:
+                        del self.trades[u]
+
+                    continue
 
                 # PRICE
 
