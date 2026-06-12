@@ -406,6 +406,18 @@ class Engine:
 
         up = text.upper()
 
+        if "STANDARD BALANCED FLOW" in up:
+            return "STANDARD BALANCED FLOW"
+
+        if "DIRECT: AGGRESSIVE OTM WRITER" in up:
+            return "DIRECT: AGGRESSIVE OTM WRITER"
+
+        if "DIRECT: AGGRESSIVE ITM WRITER" in up:
+            return "DIRECT: AGGRESSIVE ITM WRITER"
+
+        if "DIRECT: AGGRESSIVE ITM SHORT COVERING" in up:
+            return "DIRECT: AGGRESSIVE ITM SHORT COVERING"
+
         if "FULL 2MIN FAST ITM WRITING" in up:
             return "FULL 2MIN FAST ITM WRITING"
 
