@@ -412,6 +412,9 @@ class Engine:
         if "DIRECT: AGGRESSIVE OTM WRITER" in up:
             return "DIRECT: AGGRESSIVE OTM WRITER"
 
+        if "DIRECT: AGGRESSIVE OTM SHORT COVERING" in up:
+            return "DIRECT: AGGRESSIVE OTM SHORT COVERING"
+
         if "DIRECT: AGGRESSIVE ITM WRITER" in up:
             return "DIRECT: AGGRESSIVE ITM WRITER"
 
