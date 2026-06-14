@@ -453,7 +453,7 @@ class Engine:
         )
 
         m = re.search(
-            rf"ACTION:\s*EXIT\s+({pat})\b",
+            rf"EXIT\s+({pat})\b",
             up,
         )
 
@@ -1560,6 +1560,15 @@ async def main():
         client.run_until_disconnected(),
         monitor(),
     )
+
+# =========================
+# START
+# =========================
+
+if __name__ == "__main__":
+
+    asyncio.run(main())
+)
 
 # =========================
 # START
