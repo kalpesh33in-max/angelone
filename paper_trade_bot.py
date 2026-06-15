@@ -157,6 +157,10 @@ SUPPORTED = {
     "RELIANCE",
 }
 
+EXPLOSIVE_OPT_THRESHOLD = 15.0
+LOCK_IN_POINTS = 150
+TRAILING_GAP = 120
+
 # =========================
 # HELPERS
 # =========================
@@ -1192,133 +1196,35 @@ class Engine:
                 )
 
                 # SL
+                is_sl_hit = False
+                if t.option_type == "CE" and p <= t.sl:
+                    is_sl_hit = True
+                elif t.option_type == "PE" and p >= t.sl:
+                    is_sl_hit = True
 
-                if p <= t.sl:
-
-                    msgs.append(
-                        f"❌ {u} SL HIT @ {p:.2f}"
-                    )
-
-                    ok, exit_msgs = self.close_trade(
-                        t,
-                        "SL HIT",
-                        p,
-                    )
-
+                if is_sl_hit:
+                    msgs.append(f"❌ {u} TRAILING SL HIT @ {p:.2f}")
+                    ok, exit_msgs = self.close_trade(t, "TRAILING SL HIT", p)
                     msgs.extend(exit_msgs)
-
                     if ok:
                         del self.trades[u]
-
                     continue
+                
+                # Check for Trailing SL update
+                trail = self.trail_sl(t, p)
+                if trail:
+                    old_sl, new_sl = trail
+                    msgs.append(f"🎯 {u} {t.strike} {t.option_type} TRAILING SL MOVED {old_sl:.2f} -> {new_sl:.2f}")
 
                 # TARGET
 
                 closed = False
 
-                while (
-                    t.target_hit < MAX_TARGET
-                    and p >= t.targets[t.target_hit]
-                ):
 
-                    t.target_hit += 1
 
-                    if t.target_hit >= MAX_TARGET:
 
-                        msgs.append(
-                            f"✅ {u} "
-                            f"{t.strike} "
-                            f"{t.option_type} "
-                            f"T{t.target_hit} REACHED - "
-                            f"BOOK ALL @ {p:.2f} "
-                            f"(NO TRAIL NOW)"
-                        )
 
-                        ok, exit_msgs = self.close_trade(
-                            t,
-                            "T5 BOOK ALL",
-                            p,
-                        )
 
-                        msgs.extend(exit_msgs)
-
-                        if ok:
-                            del self.trades[u]
-                            closed = True
-
-                        break
-
-                    trail = self.trail_sl(t)
-
-                    if trail:
-
-                        old_sl, new_sl = trail
-
-                        msgs.append(
-                            f"🎯 {u} "
-                            f"{t.strike} "
-                            f"{t.option_type} "
-                            f"T{t.target_hit} REACHED - "
-                            f"BOOK PROFIT OR TRAIL SL "
-                            f"{old_sl:.2f} -> "
-                            f"{new_sl:.2f}"
-                        )
-
-                if closed:
-                    continue
-
-                # REVERSE PROTECTION
-
-                if t.is_reverse and t.target_hit == 0:
-
-                    protect = REVERSE_PROTECT_POINTS.get(
-                        u,
-                        trade_step(u),
-                    )
-
-                    if (
-                        not t.reverse_protected
-                        and p >= t.entry + protect
-                    ):
-
-                        old_sl = t.sl
-                        t.sl = max(t.sl, t.entry)
-                        t.reverse_protected = True
-
-                        msgs.append(
-                            f"🛡️ {u} REVERSE PROTECT\n"
-                            f"PRICE: {p:.2f}\n"
-                            f"SL MOVED: {old_sl:.2f} -> "
-                            f"{t.sl:.2f}"
-                        )
-
-                # TIME EXIT: if T1 is not reached within 4 minutes, close.
-
-                if (
-                    t.target_hit == 0
-                    and datetime.now(IST) - t.opened_at
-                    >= timedelta(seconds=NO_T1_EXIT_SECONDS)
-                    and p < t.targets[0]
-                ):
-
-                    msgs.append(
-                        f"⚠️ {u} NO T1 EXIT\n\n"
-                        f"NO T1 IN 4 MINUTES\n"
-                        f"EXIT @ {p:.2f}"
-                    )
-
-                    ok, exit_msgs = self.close_trade(
-                        t,
-                        "NO T1 4 MIN",
-                        p,
-                    )
-
-                    msgs.extend(exit_msgs)
-
-                    if ok:
-                        del self.trades[u]
-
-                    continue
 
                 # PRICE
 
