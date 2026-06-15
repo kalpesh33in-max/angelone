@@ -133,7 +133,7 @@ STEP = 30
 MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
-NO_T1_EXIT_SECONDS = env_int("NO_T1_EXIT_SECONDS", "240")
+NO_T1_EXIT_SECONDS = 180
 
 REVERSE_PROTECT_POINTS = {
     "NIFTY": env_float("NIFTY_REVERSE_PROTECT_POINTS", "5"),
@@ -1226,6 +1226,23 @@ class Engine:
 
 
 
+                                # TIME EXIT (3 MIN NO REACTION)
+                # If price hasn't moved at least 30 pts (T1) in 3 minutes, cut the trade.
+                if (
+                    datetime.now(IST) - t.opened_at >= timedelta(seconds=NO_T1_EXIT_SECONDS)
+                    and (t.high_price < t.targets[0] if t.option_type == 'CE' else t.high_price > t.targets[0])
+                ):
+                    msgs.append(
+                        f"⚠️ {u} NO REACTION EXIT\n\n"
+                        f"Price failed to reach T1 within 3 minutes.\n"
+                        f"EXIT @ {p:.2f}"
+                    )
+                    ok, exit_msgs = self.close_trade(t, "NO T1 3 MIN", p)
+                    msgs.extend(exit_msgs)
+                    if ok:
+                        del self.trades[u]
+                    continue
+                    
                 # PRICE
 
                 if p > t.last_alert:
