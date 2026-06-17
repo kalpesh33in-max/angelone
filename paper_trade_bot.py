@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -120,6 +121,11 @@ REAL_ALLOWED_UNDERLYINGS = env_csv(
     "NIFTY,BANKNIFTY",
 )
 
+# Matrix / Element X Credentials
+MATRIX_HOMESERVER = env("MATRIX_HOMESERVER", "https://matrix.org")
+MATRIX_ACCESS_TOKEN = env("MATRIX_ACCESS_TOKEN", "")
+MATRIX_ROOM_ID = env("paper-trade-bot") or env("MATRIX_ROOM_ID", "")
+
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
     "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
@@ -234,11 +240,11 @@ def trade_option_type(option_type):
 
 def tg(text):
 
-    print(f"TG:\n{text}")
+    print(f"ALERT:\n{text}")
 
+    # --- Send to Telegram ---
     try:
-
-        r = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
@@ -246,12 +252,27 @@ def tg(text):
             },
             timeout=30,
         )
-
-        print(f"TG STATUS: {r.status_code}")
-
     except Exception as e:
-
         print(f"TG ERROR: {safe(e)}")
+
+    # --- Send to Matrix / Element X ---
+    if MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
+        try:
+            txn_id = str(uuid.uuid4())
+            url = f"{MATRIX_HOMESERVER}/_matrix/client/v3/rooms/{MATRIX_ROOM_ID}/send/m.room.message/{txn_id}"
+            headers = {
+                "Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "msgtype": "m.text",
+                "body": text
+            }
+            res = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
+            if res.status_code != 200:
+                print(f"MATRIX ERROR: {res.status_code} - {res.text}")
+        except Exception as e:
+            print(f"MATRIX EXCEPTION: {safe(e)}")
 
 # =========================
 # TRADE
