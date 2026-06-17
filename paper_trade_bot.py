@@ -281,6 +281,7 @@ class Trade:
 
     target_hit: int = 0
     last_alert: float = 0
+    high_price: float = 0
     is_reverse: bool = False
     signal_source: str | None = None
     opened_at: datetime = field(
@@ -1017,10 +1018,12 @@ class Engine:
         )
 
         step = trade_step(u)
-        targets = [
-            price + step * i
-            for i in range(1, MAX_TARGET + 1)
-        ]
+        if ot == "CE":
+            sl = price - step
+            targets = [price + step * i for i in range(1, MAX_TARGET + 1)]
+        else:
+            sl = price + step
+            targets = [price - step * i for i in range(1, MAX_TARGET + 1)]
 
         return Trade(
             underlying=u,
@@ -1032,10 +1035,11 @@ class Engine:
             exchange=ex,
 
             entry=price,
-            sl=price - step,
+            sl=sl,
             targets=targets,
 
             qty=LOT_SIZES.get(u, 1),
+            high_price=price,
             is_reverse=is_reverse,
             signal_source=signal_source,
         )
@@ -1054,10 +1058,15 @@ class Engine:
                 trade.target_hit - 2
             ]
 
-        if new_sl > trade.sl:
-            old = trade.sl
-            trade.sl = new_sl
-            return old, new_sl
+        old_sl = trade.sl
+        if trade.option_type == "CE":
+            if new_sl > trade.sl:
+                trade.sl = new_sl
+                return old_sl, new_sl
+        else:
+            if new_sl < trade.sl:
+                trade.sl = new_sl
+                return old_sl, new_sl
 
         return None
 
@@ -1376,23 +1385,38 @@ class Engine:
                         del self.trades[u]
                     continue
                 
-                # Check for Trailing SL update
-                trail = self.trail_sl(t, p)
-                if trail:
-                    old_sl, new_sl = trail
-                    msgs.append(f"🎯 {u} {t.strike} {t.option_type} TRAILING SL MOVED {old_sl:.2f} -> {new_sl:.2f}")
+                # Check for Trailing SL update (if any momentum-based trailing exists, but here we use target-based)
+                # trail = self.trail_sl(t) # Called inside target logic below
 
                 # TARGET
-
                 closed = False
+                while (
+                    t.target_hit < len(t.targets)
+                    and (p >= t.targets[t.target_hit] if t.option_type == "CE" else p <= t.targets[t.target_hit])
+                ):
+                    t.target_hit += 1
+                    target_no = t.target_hit
+                    msgs.append(f"🎯 {u} T{target_no} HIT @ {p:.2f}")
 
+                    # SL shift every target hit right
+                    trail_res = self.trail_sl(t)
+                    if trail_res:
+                        old_sl, new_sl = trail_res
+                        msgs.append(f"🛡️ {u} SL MOVED: {old_sl:.2f} -> {new_sl:.2f}")
 
+                    if target_no >= MAX_TARGET:
+                        msgs.append(f"🏁 {u} FINAL TARGET REACHED. EXITING.")
+                        ok, exit_msgs = self.close_trade(t, f"T{target_no} HIT", p)
+                        msgs.extend(exit_msgs)
+                        if ok:
+                            del self.trades[u]
+                            closed = True
+                        break
 
+                if closed:
+                    continue
 
-
-
-
-                                # TIME EXIT (3 MIN NO REACTION)
+                # TIME EXIT (3 MIN NO REACTION)
                 # If price hasn't moved at least 30 pts (T1) in 3 minutes, cut the trade.
                 if (
                     datetime.now(IST) - t.opened_at >= timedelta(seconds=NO_T1_EXIT_SECONDS)
@@ -1410,11 +1434,19 @@ class Engine:
                     continue
                     
                 # PRICE
+                # For CE, high_price is max. For PE, high_price is min (most favorable).
+                new_fav = False
+                if t.option_type == "CE":
+                    if p > t.high_price:
+                        t.high_price = p
+                        new_fav = True
+                else:
+                    if p < t.high_price or t.high_price == 0:
+                        t.high_price = p
+                        new_fav = True
 
-                if p > t.last_alert:
-
+                if new_fav:
                     t.last_alert = p
-
                     msgs.append(
                         f"📈 {u} "
                         f"PRICE {p:.2f}"
