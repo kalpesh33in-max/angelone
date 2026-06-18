@@ -124,6 +124,9 @@ REAL_ALLOWED_UNDERLYINGS = env_csv(
 # Matrix / Element X Credentials
 MATRIX_HOMESERVER = env("MATRIX_HOMESERVER", "https://matrix.org")
 MATRIX_ACCESS_TOKEN = env("MATRIX_ACCESS_TOKEN", "")
+MATRIX_USER = env("MATRIX_USER", "")
+MATRIX_PASS = env("MATRIX_PASS", "")
+MATRIX_TOKEN_FILE = "matrix_access_token.txt"
 MATRIX_ROOM_ID = env("paper-trade-bot") or env("MATRIX_ROOM_ID", "")
 
 LOT_SIZES = {
@@ -238,6 +241,57 @@ def trade_step(underlying):
 def trade_option_type(option_type):
     return option_type
 
+# =========================
+# MATRIX UTILS
+# =========================
+
+def perform_matrix_login():
+    if not MATRIX_USER or not MATRIX_PASS:
+        return None
+    
+    login_url = f"{MATRIX_HOMESERVER}/_matrix/client/v3/login"
+    payload = {
+        "type": "m.login.password",
+        "user": MATRIX_USER,
+        "password": MATRIX_PASS,
+        "initial_device_display_name": "PaperTradeBotAuto"
+    }
+    
+    try:
+        response = requests.post(login_url, json=payload, timeout=15)
+        if response.status_code == 200:
+            token = response.json().get("access_token")
+            if token:
+                with open(MATRIX_TOKEN_FILE, "w") as f:
+                    f.write(token)
+                print("✅ Matrix auto-login successful.")
+                return token
+        else:
+            print(f"❌ Matrix auto-login failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"❌ Matrix auto-login error: {safe(e)}")
+    return None
+
+def get_matrix_token():
+    # 1. Try to read from file first
+    token = None
+    if os.path.exists(MATRIX_TOKEN_FILE):
+        try:
+            with open(MATRIX_TOKEN_FILE, "r") as f:
+                token = f.read().strip()
+        except Exception as e:
+            print(f"❌ Error reading {MATRIX_TOKEN_FILE}: {safe(e)}")
+    
+    # 2. Fallback to environment variable
+    if not token:
+        token = MATRIX_ACCESS_TOKEN
+        
+    # 3. Auto-login if still no token
+    if not token:
+        token = perform_matrix_login()
+        
+    return token
+
 def tg(text):
 
     print(f"ALERT:\n{text}")
@@ -256,12 +310,13 @@ def tg(text):
         print(f"TG ERROR: {safe(e)}")
 
     # --- Send to Matrix / Element X ---
-    if MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
+    token = get_matrix_token()
+    if token and MATRIX_ROOM_ID:
         try:
             txn_id = str(uuid.uuid4())
             url = f"{MATRIX_HOMESERVER}/_matrix/client/v3/rooms/{MATRIX_ROOM_ID}/send/m.room.message/{txn_id}"
             headers = {
-                "Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
             payload = {
@@ -269,6 +324,14 @@ def tg(text):
                 "body": text
             }
             res = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
+            
+            if res.status_code == 401:
+                print("⚠️ Matrix token expired. Attempting auto-login...")
+                new_token = perform_matrix_login()
+                if new_token:
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    res = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
+
             if res.status_code != 200:
                 print(f"MATRIX ERROR: {res.status_code} - {res.text}")
         except Exception as e:
