@@ -1114,12 +1114,10 @@ class Engine:
         )
 
         step = trade_step(u)
-        if ot == "CE":
-            sl = price - step
-            targets = [price + step * i for i in range(1, MAX_TARGET + 1)]
-        else:
-            sl = price + step
-            targets = [price - step * i for i in range(1, MAX_TARGET + 1)]
+        # CE and PE are both long option-premium trades. Profit happens when
+        # the bought option premium rises.
+        sl = price - step
+        targets = [price + step * i for i in range(1, MAX_TARGET + 1)]
 
         return Trade(
             underlying=u,
@@ -1155,14 +1153,9 @@ class Engine:
             ]
 
         old_sl = trade.sl
-        if trade.option_type == "CE":
-            if new_sl > trade.sl:
-                trade.sl = new_sl
-                return old_sl, new_sl
-        else:
-            if new_sl < trade.sl:
-                trade.sl = new_sl
-                return old_sl, new_sl
+        if new_sl > trade.sl:
+            trade.sl = new_sl
+            return old_sl, new_sl
 
         return None
 
@@ -1467,11 +1460,7 @@ class Engine:
                 )
 
                 # SL
-                is_sl_hit = False
-                if t.option_type == "CE" and p <= t.sl:
-                    is_sl_hit = True
-                elif t.option_type == "PE" and p >= t.sl:
-                    is_sl_hit = True
+                is_sl_hit = p <= t.sl
 
                 if is_sl_hit:
                     msgs.append(f"❌ {u} TRAILING SL HIT @ {p:.2f}")
@@ -1488,7 +1477,7 @@ class Engine:
                 closed = False
                 while (
                     t.target_hit < len(t.targets)
-                    and (p >= t.targets[t.target_hit] if t.option_type == "CE" else p <= t.targets[t.target_hit])
+                    and p >= t.targets[t.target_hit]
                 ):
                     t.target_hit += 1
                     target_no = t.target_hit
@@ -1516,7 +1505,7 @@ class Engine:
                 # If price hasn't moved at least 30 pts (T1) in 3 minutes, cut the trade.
                 if (
                     datetime.now(IST) - t.opened_at >= timedelta(seconds=NO_T1_EXIT_SECONDS)
-                    and (t.high_price < t.targets[0] if t.option_type == 'CE' else t.high_price > t.targets[0])
+                    and t.high_price < t.targets[0]
                 ):
                     msgs.append(
                         f"⚠️ {u} NO REACTION EXIT\n\n"
@@ -1530,16 +1519,10 @@ class Engine:
                     continue
                     
                 # PRICE
-                # For CE, high_price is max. For PE, high_price is min (most favorable).
                 new_fav = False
-                if t.option_type == "CE":
-                    if p > t.high_price:
-                        t.high_price = p
-                        new_fav = True
-                else:
-                    if p < t.high_price or t.high_price == 0:
-                        t.high_price = p
-                        new_fav = True
+                if p > t.high_price:
+                    t.high_price = p
+                    new_fav = True
 
                 if new_fav:
                     t.last_alert = p
