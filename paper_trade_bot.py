@@ -122,12 +122,13 @@ REAL_ALLOWED_UNDERLYINGS = env_csv(
 )
 
 # Matrix / Element X Credentials
-MATRIX_HOMESERVER = env("MATRIX_HOMESERVER", "https://matrix.org")
+MATRIX_HOMESERVER = env("MATRIX_HOMESERVER", "https://matrix.org").rstrip("/")
 MATRIX_ACCESS_TOKEN = env("MATRIX_ACCESS_TOKEN", "")
 MATRIX_USER = env("MATRIX_USER", "")
 MATRIX_PASS = env("MATRIX_PASS", "")
-MATRIX_TOKEN_FILE = "matrix_access_token.txt"
-MATRIX_ROOM_ID = env("paper-trade-bot") or env("MATRIX_ROOM_ID", "")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MATRIX_TOKEN_FILE = os.path.join(BASE_DIR, "matrix_access_token.txt")
+MATRIX_ROOM_ID = env("MATRIX_ROOM_ID", "")
 
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
@@ -272,6 +273,13 @@ def perform_matrix_login():
         print(f"❌ Matrix auto-login error: {safe(e)}")
     return None
 
+def clear_matrix_token_file():
+    try:
+        if os.path.exists(MATRIX_TOKEN_FILE):
+            os.remove(MATRIX_TOKEN_FILE)
+    except Exception as e:
+        print(f"❌ Error clearing {MATRIX_TOKEN_FILE}: {safe(e)}")
+
 def get_matrix_token():
     # 1. Try to read from file first
     token = None
@@ -291,6 +299,10 @@ def get_matrix_token():
         token = perform_matrix_login()
         
     return token
+
+def refresh_matrix_token():
+    clear_matrix_token_file()
+    return perform_matrix_login()
 
 def tg(text):
 
@@ -325,9 +337,9 @@ def tg(text):
             }
             res = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
             
-            if res.status_code == 401:
-                print("⚠️ Matrix token expired. Attempting auto-login...")
-                new_token = perform_matrix_login()
+            if res.status_code in (401, 403):
+                print(f"⚠️ Matrix token rejected ({res.status_code}). Attempting auto-login...")
+                new_token = refresh_matrix_token()
                 if new_token:
                     headers["Authorization"] = f"Bearer {new_token}"
                     res = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
