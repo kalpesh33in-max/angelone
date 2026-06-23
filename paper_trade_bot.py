@@ -167,6 +167,13 @@ SUPPORTED = {
     "RELIANCE",
 }
 
+INDEX_SYMBOLS = {
+    "NIFTY",
+    "BANKNIFTY",
+    "SENSEX",
+    "MIDCPNIFTY",
+}
+
 STRIKE_STEPS = {
     "BANKNIFTY": env_int("BANKNIFTY_STRIKE_STEP", "100"),
     "NIFTY": env_int("NIFTY_STRIKE_STEP", "50"),
@@ -178,6 +185,11 @@ STRIKE_STEPS = {
 }
 
 FUT_LOT_THRESHOLD = env_int("FUT_LOT_THRESHOLD", "3000")
+CROR_OPTION_WRITER_LOTS = env_int("CROR_OPTION_WRITER_LOTS", "500")
+CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
+CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
+CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "1000")
+CROR_INDEX_FUT_LOTS = env_int("CROR_INDEX_FUT_LOTS", "3000")
 ITM_WRITER_THRESHOLD_CR = env_float("ITM_WRITER_THRESHOLD_CR", "11")
 ITM_SC_THRESHOLD_CR = env_float("ITM_SC_THRESHOLD_CR", "20")
 ITM_WRITER_CONFLICT_CR = env_float("ITM_WRITER_CONFLICT_CR", "10")
@@ -595,8 +607,7 @@ class Engine:
         df = pd.read_json(MASTER_FILE)
 
         df = df[
-            (df.exch_seg.isin(["NFO", "BFO"]))
-            & (df.name.isin(SUPPORTED))
+            df.exch_seg.isin(["NFO", "BFO"])
         ].copy()
 
         df["expiry"] = pd.to_datetime(
@@ -666,6 +677,142 @@ class Engine:
             )
 
         return valid[-1] if valid else None
+
+    # =====================
+
+    def _cror_value(self, pattern, text, cast=float, default=None):
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            return default
+        try:
+            return cast(str(m.group(1)).replace(",", ""))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_cror_alerts(self, text):
+        alerts = []
+        blocks = re.split(r"\n\s*-{3,}\s*\n", text.strip())
+
+        for block in blocks:
+            up = block.upper()
+            action = None
+            for candidate in ("SHORT COVERING", "UNWINDING", "WRITER", "BUYER"):
+                if re.search(rf"\b{candidate}\b", up):
+                    action = candidate
+                    break
+
+            if not action:
+                continue
+
+            lots = self._cror_value(r"\bLots\s*:\s*([\d,]+)", block, int)
+            price = self._cror_value(r"\bPrice\s*:\s*([\d.]+)", block, float)
+            fut_price = self._cror_value(r"\bFut\s+Price\s*:\s*([\d.]+)", block, float)
+            turnover = self._cror_value(r"\bTurnover\s*:\s*(?:₹|Rs\.?)?\s*([\d.]+)\s*Cr", block, float)
+
+            opt = re.search(
+                r"(?:NFO:)?([A-Z&]+?)(\d{2}[A-Z]{3})(\d{3,6})(CE|PE)\s*\(([^)]*ITM[^)]*)\)",
+                up,
+            )
+
+            if opt:
+                symbol = opt.group(1)
+                strike = int(opt.group(3))
+                option_type = opt.group(4)
+                moneyness = opt.group(5)
+
+                if lots is None:
+                    continue
+
+                threshold = None
+                if action == "WRITER":
+                    threshold = CROR_OPTION_WRITER_LOTS
+                elif action == "SHORT COVERING":
+                    threshold = CROR_OPTION_SHORT_COVERING_LOTS
+                elif action == "BUYER":
+                    threshold = CROR_OPTION_BUYER_LOTS
+
+                if threshold is None or lots < threshold:
+                    continue
+
+                if action == "WRITER":
+                    signal_ot = "PE" if option_type == "CE" else "CE"
+                else:
+                    signal_ot = option_type
+
+                entry_allowed = "NEAR-ITM" not in moneyness
+
+                alerts.append(
+                    {
+                        "kind": "OPTION",
+                        "symbol": symbol,
+                        "strike": strike,
+                        "option_type": option_type,
+                        "signal_ot": signal_ot,
+                        "entry_allowed": entry_allowed,
+                        "action": action,
+                        "lots": lots,
+                        "price": price,
+                        "fut_price": fut_price,
+                        "turnover": turnover,
+                        "moneyness": moneyness,
+                        "threshold": threshold,
+                    }
+                )
+                continue
+
+            fut = re.search(
+                r"(?:NFO:)?([A-Z&]+?)(\d{2}[A-Z]{3})FUT\b",
+                up,
+            )
+
+            if fut and lots is not None:
+                symbol = fut.group(1)
+                threshold = (
+                    CROR_INDEX_FUT_LOTS
+                    if symbol in INDEX_SYMBOLS
+                    else CROR_STOCK_FUT_LOTS
+                )
+
+                if lots >= threshold:
+                    alerts.append(
+                        {
+                            "kind": "FUTURE",
+                            "symbol": symbol,
+                            "action": action,
+                            "lots": lots,
+                            "price": price,
+                            "fut_price": fut_price,
+                            "turnover": turnover,
+                            "threshold": threshold,
+                        }
+                    )
+
+        return alerts
+
+    def cror_alert_text(self, a):
+        if a["kind"] == "FUTURE":
+            return (
+                f"CROR FUTURE ALERT\n"
+                f"{a['symbol']} FUT {a['action']}\n"
+                f"LOTS: {a['lots']} >= {a['threshold']}\n"
+                f"TURNOVER: {a['turnover']} Cr\n"
+                f"PRICE: {a['price']}\n"
+                f"NOTE: FUTURE ALERT ONLY - NO TRADE"
+            )
+
+        side = "CALL" if a["signal_ot"] == "CE" else "PUT"
+        mode = "ENTRY/EXIT" if a["entry_allowed"] else "EXIT ONLY"
+        return (
+            f"CROR OPTION TRIGGER\n"
+            f"{a['symbol']} {a['strike']} {a['option_type']} {a['moneyness']}\n"
+            f"ACTION: {a['action']}\n"
+            f"MODE: {mode}\n"
+            f"LOTS: {a['lots']} >= {a['threshold']}\n"
+            f"TURNOVER: {a['turnover']} Cr\n"
+            f"OPTION PRICE: {a['price']}\n"
+            f"FUT PRICE: {a['fut_price']}\n"
+            f"SIGNAL: BUY {side} ({a['signal_ot']})"
+        )
 
     # =====================
 
@@ -817,6 +964,7 @@ class Engine:
             row.symbol,
             row.token,
             row.exch_seg,
+            int(float(row.get("lotsize", LOT_SIZES.get(u, 1)))),
         )
 
     # =====================
@@ -1101,7 +1249,7 @@ class Engine:
         signal_source=None,
     ):
 
-        sym, token, ex = self.resolve(
+        sym, token, ex, lot_size = self.resolve(
             u,
             s,
             ot,
@@ -1132,7 +1280,7 @@ class Engine:
             sl=sl,
             targets=targets,
 
-            qty=LOT_SIZES.get(u, 1),
+            qty=lot_size,
             high_price=price,
             is_reverse=is_reverse,
             signal_source=signal_source,
@@ -1646,7 +1794,7 @@ async def main():
             # =====================
             # SOURCE FILTER
             # =====================
-            src = str(SOURCE_CHAT).strip().lower()
+            src = str(SOURCE_CHAT).strip().lower().lstrip("@")
             cands = [str(event.chat_id).lower()]
             for v in (getattr(chat, "title", None), getattr(chat, "username", None), getattr(chat, "first_name", None)):
                 if v: cands.append(str(v).strip().lower())
@@ -1655,6 +1803,65 @@ async def main():
 
             print(f"\nVALID MESSAGE:\n{text}\n")
             now = datetime.now(IST)
+
+            # =====================
+            # CROR SCAN BOT DETECTION
+            # =====================
+            cror_alerts = engine.parse_cror_alerts(text)
+            if cror_alerts:
+                for a in cror_alerts:
+                    tg(engine.cror_alert_text(a))
+
+                    if a["kind"] == "FUTURE":
+                        continue
+
+                    symbol = a["symbol"]
+                    if not engine.strike_ok(symbol, a["strike"]):
+                        tg(
+                            f"CROR TRADE SKIPPED\n"
+                            f"{symbol} {a['strike']} strike out of allowed range"
+                        )
+                        continue
+
+                    active = engine.trades.get(symbol)
+                    if not a["entry_allowed"]:
+                        if not active:
+                            tg(
+                                f"CROR ENTRY SKIPPED\n"
+                                f"{symbol} {a['strike']} {a['option_type']} is NEAR-ITM\n"
+                                f"RULE: NEAR-ITM is exit-only"
+                            )
+                            continue
+
+                        if active.option_type == a["signal_ot"]:
+                            tg(
+                                f"CROR EXIT CHECK - NO ACTION\n"
+                                f"{symbol} active {active.option_type}, signal {a['signal_ot']}\n"
+                                f"RULE: NEAR-ITM exits only on opposite signal"
+                            )
+                            continue
+
+                    signal_desc = (
+                        f"{symbol} {a['strike']} {a['signal_ot']} "
+                        f"(CROR {a['action']} {a['lots']} lots)"
+                    )
+                    source = (
+                        f"CROR {a['action']} {a['lots']} lots "
+                        f"on {a['option_type']} {a['moneyness']}"
+                    )
+                    trade, msgs = engine.signal(
+                        symbol,
+                        a["strike"],
+                        a["signal_ot"],
+                        False,
+                        source,
+                    )
+                    for msg in msgs:
+                        tg(msg)
+                    if trade:
+                        tg(fmt(trade))
+
+                return
 
             # =====================
             # FLOW SIGNAL DETECTION
