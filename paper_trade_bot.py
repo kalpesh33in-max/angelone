@@ -696,7 +696,7 @@ class Engine:
         for block in blocks:
             up = block.upper()
             action = None
-            for candidate in ("SHORT COVERING", "UNWINDING", "WRITER", "BUYER"):
+            for candidate in ("SHORT COVERING", "UNWINDING", "FUT BUY", "FUT SELL", "BUYER", "WRITER", "BUY", "SELL"):
                 if re.search(rf"\b{candidate}\b", up):
                     action = candidate
                     break
@@ -774,10 +774,17 @@ class Engine:
                 )
 
                 if lots >= threshold:
+                    signal_ot = None
+                    if action in {"SHORT COVERING", "FUT BUY", "BUY", "BUYER"}:
+                        signal_ot = "CE"
+                    elif action in {"UNWINDING", "FUT SELL", "SELL"}:
+                        signal_ot = "PE"
+
                     alerts.append(
                         {
                             "kind": "FUTURE",
                             "symbol": symbol,
+                            "signal_ot": signal_ot,
                             "action": action,
                             "lots": lots,
                             "price": price,
@@ -791,27 +798,23 @@ class Engine:
 
     def cror_alert_text(self, a):
         if a["kind"] == "FUTURE":
+            extra = ""
+            if a.get("signal_ot"):
+                side = "CALL" if a["signal_ot"] == "CE" else "PUT"
+                extra = f"\nSIGNAL: ATM {side}"
             return (
                 f"CROR FUTURE ALERT\n"
                 f"{a['symbol']} FUT {a['action']}\n"
                 f"LOTS: {a['lots']} >= {a['threshold']}\n"
                 f"TURNOVER: {a['turnover']} Cr\n"
-                f"PRICE: {a['price']}\n"
-                f"NOTE: FUTURE ALERT ONLY - NO TRADE"
+                f"PRICE: {a['price']}"
+                f"{extra}"
             )
 
         side = "CALL" if a["signal_ot"] == "CE" else "PUT"
-        mode = "ENTRY/EXIT" if a["entry_allowed"] else "EXIT ONLY"
         return (
-            f"CROR OPTION TRIGGER\n"
             f"{a['symbol']} {a['strike']} {a['option_type']} {a['moneyness']}\n"
-            f"ACTION: {a['action']}\n"
-            f"MODE: {mode}\n"
-            f"LOTS: {a['lots']} >= {a['threshold']}\n"
-            f"TURNOVER: {a['turnover']} Cr\n"
-            f"OPTION PRICE: {a['price']}\n"
-            f"FUT PRICE: {a['fut_price']}\n"
-            f"SIGNAL: BUY {side} ({a['signal_ot']})"
+            f"ACTION: {a['action']} LOTS: {a['lots']} >= {a['threshold']}"
         )
 
     # =====================
@@ -1813,13 +1816,57 @@ async def main():
                     tg(engine.cror_alert_text(a))
 
                     if a["kind"] == "FUTURE":
+                        symbol = a["symbol"]
+                        if not a.get("signal_ot"):
+                            tg(
+                                f"CROR FUTURE TRADE SKIPPED\n"
+                                f"{symbol} FUT {a['action']} has no CALL/PUT direction"
+                            )
+                            continue
+
+                        if not a.get("fut_price"):
+                            tg(
+                                f"CROR FUTURE TRADE SKIPPED\n"
+                                f"{symbol} FUT missing Fut Price for ATM strike"
+                            )
+                            continue
+
+                        trade_strike = engine.get_atm(a["fut_price"], symbol)
+                        signal_desc = (
+                            f"{symbol} ATM {trade_strike} {a['signal_ot']} "
+                            f"(CROR FUT {a['action']} {a['lots']} lots)"
+                        )
+                        source = (
+                            f"CROR FUT {a['action']} {a['lots']} lots "
+                            f"ATM from Fut Price {a['fut_price']}"
+                        )
+                        trade, msgs = engine.signal(
+                            symbol,
+                            trade_strike,
+                            a["signal_ot"],
+                            False,
+                            source,
+                        )
+                        for msg in msgs:
+                            tg(msg)
+                        if trade:
+                            tg(fmt(trade))
                         continue
 
                     symbol = a["symbol"]
-                    if not engine.strike_ok(symbol, a["strike"]):
+                    if not a.get("fut_price"):
                         tg(
                             f"CROR TRADE SKIPPED\n"
-                            f"{symbol} {a['strike']} strike out of allowed range"
+                            f"{symbol} {a['strike']} {a['option_type']} missing Fut Price for ATM strike"
+                        )
+                        continue
+
+                    trade_strike = engine.get_atm(a["fut_price"], symbol)
+
+                    if not engine.strike_ok(symbol, trade_strike):
+                        tg(
+                            f"CROR TRADE SKIPPED\n"
+                            f"{symbol} ATM {trade_strike} strike out of allowed range"
                         )
                         continue
 
@@ -1842,16 +1889,17 @@ async def main():
                             continue
 
                     signal_desc = (
-                        f"{symbol} {a['strike']} {a['signal_ot']} "
+                        f"{symbol} ATM {trade_strike} {a['signal_ot']} "
                         f"(CROR {a['action']} {a['lots']} lots)"
                     )
                     source = (
                         f"CROR {a['action']} {a['lots']} lots "
-                        f"on {a['option_type']} {a['moneyness']}"
+                        f"on {a['option_type']} {a['moneyness']} "
+                        f"ATM from Fut Price {a['fut_price']}"
                     )
                     trade, msgs = engine.signal(
                         symbol,
-                        a["strike"],
+                        trade_strike,
                         a["signal_ot"],
                         False,
                         source,
