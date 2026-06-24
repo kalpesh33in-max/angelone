@@ -143,7 +143,12 @@ STEP = 30
 MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
-NO_T1_EXIT_SECONDS = 180
+REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
+OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "5")
+STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "2")
+STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
+STOCK_MIS_SL_POINTS = env_float("STOCK_MIS_SL_POINTS", "5")
+STOCK_MIS_TARGET_POINTS = env_float("STOCK_MIS_TARGET_POINTS", "10")
 
 REVERSE_PROTECT_POINTS = {
     "NIFTY": env_float("NIFTY_REVERSE_PROTECT_POINTS", "5"),
@@ -157,16 +162,6 @@ MASTER_URL = (
     "OpenAPI_File/files/OpenAPIScripMaster.json"
 )
 
-SUPPORTED = {
-    "NIFTY",
-    "BANKNIFTY",
-    "SENSEX",
-    "MIDCPNIFTY",
-    "HDFCBANK",
-    "ICICIBANK",
-    "RELIANCE",
-}
-
 INDEX_SYMBOLS = {
     "NIFTY",
     "BANKNIFTY",
@@ -174,31 +169,11 @@ INDEX_SYMBOLS = {
     "MIDCPNIFTY",
 }
 
-STRIKE_STEPS = {
-    "BANKNIFTY": env_int("BANKNIFTY_STRIKE_STEP", "100"),
-    "NIFTY": env_int("NIFTY_STRIKE_STEP", "50"),
-    "SENSEX": env_int("SENSEX_STRIKE_STEP", "100"),
-    "MIDCPNIFTY": env_int("MIDCPNIFTY_STRIKE_STEP", "25"),
-    "HDFCBANK": 5,
-    "ICICIBANK": 10,
-    "RELIANCE": 10,
-}
-
-FUT_LOT_THRESHOLD = env_int("FUT_LOT_THRESHOLD", "3000")
 CROR_OPTION_WRITER_LOTS = env_int("CROR_OPTION_WRITER_LOTS", "500")
 CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
 CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
 CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "1000")
 CROR_INDEX_FUT_LOTS = env_int("CROR_INDEX_FUT_LOTS", "3000")
-ITM_WRITER_THRESHOLD_CR = env_float("ITM_WRITER_THRESHOLD_CR", "11")
-ITM_SC_THRESHOLD_CR = env_float("ITM_SC_THRESHOLD_CR", "20")
-ITM_WRITER_CONFLICT_CR = env_float("ITM_WRITER_CONFLICT_CR", "10")
-DUAL_MATCH_WINDOW_SECONDS = env_int("DUAL_MATCH_WINDOW_SECONDS", "60")
-OTM_DUAL_2MIN_TURN_CR = env_float("OTM_DUAL_2MIN_TURN_CR", "15")
-OTM_DUAL_2MIN_COMPONENT_CR = env_float("OTM_DUAL_2MIN_COMPONENT_CR", "10")
-OTM_DUAL_5MIN_TURN_CR = env_float("OTM_DUAL_5MIN_TURN_CR", "2")
-OTM_DUAL_5MIN_COMPONENT_CR = env_float("OTM_DUAL_5MIN_COMPONENT_CR", "1")
-
 EXPLOSIVE_OPT_THRESHOLD = 15.0
 LOCK_IN_POINTS = 150
 TRAILING_GAP = 120
@@ -381,6 +356,8 @@ class Trade:
     targets: list
 
     qty: int
+    side: str = "BUY"
+    instrument_kind: str = "OPTION"
 
     order_id: str | None = None
     exit_order_id: str | None = None
@@ -407,157 +384,44 @@ class Engine:
 
         self.smart = None
         self.df = None
+        self.spot_df = None
 
         self.trades = {}
         self.last_signal = {}
+        self.reverse_wait_until = {}
         self.real_trade_day = None
         self.real_entries_today = 0
 
-        # State tracking for flow signals
-        self.last_signals_by_symbol = {}
-        self.last_otm_signals_by_symbol = {}
-        self.instant_itm_alerts = {}
-        self.price_history = {} # {symbol: [(price, timestamp), ...]}
+    def get_atm(self, price, symbol, option_type):
+        symbol = symbol.upper()
+        option_type = option_type.upper()
+        rows = self.df[
+            (self.df.name == symbol)
+            & self.df.symbol.astype(str).str.endswith(option_type)
+        ].copy()
+        if rows.empty:
+            raise RuntimeError(
+                f"NO OPTION CONTRACTS: {symbol} {option_type}"
+            )
 
-    # =====================
+        nearest_expiry = rows["expiry"].min()
+        rows = rows[rows["expiry"] == nearest_expiry].copy()
+        strike_pattern = re.compile(
+            rf"^{re.escape(symbol)}\d{{2}}[A-Z]{{3}}(\d+(?:\.\d+)?){option_type}$"
+        )
+        strikes = []
+        for contract_symbol in rows.symbol.astype(str):
+            match = strike_pattern.match(contract_symbol)
+            if match:
+                strikes.append(float(match.group(1)))
 
-    def update_price_history(self, symbol, price):
-        if symbol not in self.price_history:
-            self.price_history[symbol] = []
-        self.price_history[symbol].append((price, time.time()))
-        # Keep only last 5 entries (approx 10 minutes of data)
-        if len(self.price_history[symbol]) > 5:
-            self.price_history[symbol].pop(0)
+        if not strikes:
+            raise RuntimeError(
+                f"NO PARSABLE OPTION STRIKES: {symbol} {option_type}"
+            )
 
-    def check_momentum(self, symbol, side):
-        history = self.price_history.get(symbol, [])
-        if len(history) < 2:
-            return True, "No History" # Not enough data yet
-
-        current_p, _ = history[-1]
-        prev_p, _ = history[-2] # Price from 2 mins ago
-
-        if side == "CALL":
-            res = current_p >= prev_p
-            return res, f"Bullish (Curr:{current_p} >= Prev:{prev_p})" if res else f"Bearish (Curr:{current_p} < Prev:{prev_p})"
-        else:
-            res = current_p <= prev_p
-            return res, f"Bearish (Curr:{current_p} <= Prev:{prev_p})" if res else f"Bullish (Curr:{current_p} > Prev:{prev_p})"
-
-    async def delayed_momentum_signal(self, symbol, strike, ot, source, original_price, tg_func, fmt_func):
-        """Wait 60s and re-check LTP for momentum alignment"""
-        await asyncio.sleep(60)
-        try:
-            # Resolve instrument again to get fresh LTP
-            sym, token, ex, lot_size = self.resolve(symbol, strike, ot)
-            current_ltp = self.ltp(ex, sym, token)
-
-            # Check if price has moved in direction compared to original signal
-            aligned = False
-            if ot == "CE" and current_ltp > original_price: aligned = True
-            elif ot == "PE" and current_ltp < original_price: aligned = True
-
-            if aligned:
-                trade, msgs = self.signal(symbol, strike, ot, False, f"{source} (Momentum Confirmed 60s)")
-                for msg in msgs: tg_func(msg)
-                if trade: tg_func(fmt_func(trade))
-            else:
-                tg_func(f"⚠️ SIGNAL SKIPPED: {symbol} {strike} {ot}\nNo Momentum alignment after 60s wait.\nOrig: {original_price} | Now: {current_ltp}")
-        except Exception as e:
-            print(f"DELAYED SIGNAL ERROR: {e}")
-
-    # =====================
-
-    def get_atm(self, price, symbol):
-        step = STRIKE_STEPS.get(symbol.upper(), 100)
-        return int(round(float(price) / step) * step)
-
-    def _normalize_cr(self, value, unit):
-        try:
-            val = float(value)
-            return val if unit == "Cr" else (val / 100 if unit == "L" else 0.0)
-        except: return 0.0
-
-    def get_writing_values(self, label, text):
-        pattern = rf"{label}\s+\d+\(([\d.]+)(Cr|L|)\)\s+\d+\(([\d.]+)(Cr|L|)\)"
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if not matches: return 0.0, 0.0
-        itm_val, itm_unit, otm_val, otm_unit = matches[0]
-        return self._normalize_cr(itm_val, itm_unit), self._normalize_cr(otm_val, otm_unit)
-
-    def get_value(self, label, text):
-        pattern = rf"{label}\s*:\s*([\d.]+)(Cr|L|)"
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if not matches: return 0.0
-        val_str, unit = matches[-1]
-        return self._normalize_cr(val_str, unit)
-
-    def get_future_price(self, text, symbol):
-        if not text: return None
-        pattern = rf"(?<![A-Z0-9_]){re.escape(symbol)}\s*\(FUT:\s*([\d.]+)\)"
-        match = re.search(pattern, text, re.IGNORECASE)
-        return float(match.group(1)) if match else None
-
-    def extract_instrument_section(self, text, symbol):
-        sym_pat = rf"(?<![A-Z0-9_]){re.escape(symbol)}\s*\(FUT:"
-        m = re.search(sym_pat, text, re.IGNORECASE)
-        if not m: return None
-        start = m.start()
-        next_pos = [len(text)]
-        for sym in SUPPORTED:
-            if sym == symbol: continue
-            m2 = re.search(rf"(?<![A-Z0-9_]){re.escape(sym)}\s*\(FUT:", text[m.end():], re.IGNORECASE)
-            if m2: next_pos.append(m.end() + m2.start())
-        return text[start:min(next_pos)]
-
-    def parse_flow_metrics(self, section):
-        if not section: return None
-        opt_part = section.split("---- FUTURES FLOW ----")[0]
-        c_itm, c_otm = self.get_writing_values("CALL_WR", opt_part)
-        p_itm, p_otm = self.get_writing_values("PUT_WR", opt_part)
-        cs_itm, cs_otm = self.get_writing_values("CALL_SC", opt_part)
-        ps_itm, ps_otm = self.get_writing_values("PUT_SC", opt_part)
-        return {
-            "bull_t": self.get_value("Bullish Turn", opt_part),
-            "bear_t": self.get_value("Bearish Turn", opt_part),
-            "call_itm": c_itm, "call_otm": c_otm,
-            "put_itm": p_itm, "put_otm": p_otm,
-            "call_sc_itm": cs_itm, "call_sc_otm": cs_otm,
-            "put_sc_itm": ps_itm, "put_sc_otm": ps_otm
-        }
-
-    def get_otm_dual_signal(self, metrics, short_lbl):
-        if short_lbl == "2MIN":
-            turn_min = OTM_DUAL_2MIN_TURN_CR
-            component_min = OTM_DUAL_2MIN_COMPONENT_CR
-        else:
-            turn_min = OTM_DUAL_5MIN_TURN_CR
-            component_min = OTM_DUAL_5MIN_COMPONENT_CR
-
-        bullish_components = [
-            ("PUT_WR OTM", metrics["put_otm"]),
-            ("CALL_SC OTM", metrics["call_sc_otm"]),
-        ]
-        bearish_components = [
-            ("CALL_WR OTM", metrics["call_otm"]),
-            ("PUT_SC OTM", metrics["put_sc_otm"]),
-        ]
-        bull_label, bull_component = max(bullish_components, key=lambda item: item[1])
-        bear_label, bear_component = max(bearish_components, key=lambda item: item[1])
-
-        call_ok = metrics["bull_t"] >= turn_min and bull_component >= component_min
-        put_ok = metrics["bear_t"] >= turn_min and bear_component >= component_min
-
-        if call_ok and not put_ok:
-            return {"type": "CALL", "turn": metrics["bull_t"], "component_label": bull_label, "component_value": bull_component}
-        if put_ok and not call_ok:
-            return {"type": "PUT", "turn": metrics["bear_t"], "component_label": bear_label, "component_value": bear_component}
-        return None
-
-    def get_dual_match_thresholds(self, symbol, short_lbl, now):
-        if symbol == "BANKNIFTY" and 1 <= now.day <= 10:
-            return (5.0, 5.0) if short_lbl == "2MIN" else (1.0, 1.0)
-        return (10.0, 6.5) if short_lbl == "2MIN" else (2.0, 1.0)
+        strike = min(strikes, key=lambda value: abs(value - float(price)))
+        return int(strike) if strike.is_integer() else strike
 
     # =====================
 
@@ -604,19 +468,25 @@ class Engine:
             with open(MASTER_FILE, "wb") as f:
                 f.write(r.content)
 
-        df = pd.read_json(MASTER_FILE)
-
-        df = df[
-            df.exch_seg.isin(["NFO", "BFO"])
-        ].copy()
-
-        df["expiry"] = pd.to_datetime(
-            df["expiry"],
+        master = pd.read_json(MASTER_FILE)
+        master["expiry"] = pd.to_datetime(
+            master.get("expiry"),
             format="%d%b%Y",
+            errors="coerce",
         )
 
-        self.df = df[
-            df.expiry >= datetime.now()
+        today = datetime.now(IST).date()
+        derivatives = master[
+            master.exch_seg.isin(["NFO", "BFO"])
+            & master["expiry"].notna()
+        ].copy()
+        self.df = derivatives[
+            derivatives["expiry"].dt.date >= today
+        ].copy()
+
+        self.spot_df = master[
+            (master.exch_seg == "NSE")
+            & master.symbol.astype(str).str.endswith("-EQ")
         ].copy()
 
     # =====================
@@ -630,53 +500,6 @@ class Engine:
             return 35000 <= s <= 70000
 
         return True
-
-    # =====================
-
-    def parse(self, text):
-
-        up = text.upper()
-
-        if "WATCH" in up:
-            return None
-
-        if not self.signal_source(text):
-            return None
-
-        pat = "|".join(
-            sorted(
-                SUPPORTED,
-                key=len,
-                reverse=True,
-            )
-        )
-
-        m = re.findall(
-            rf"({pat})\s+(\d{{4,6}})\s*(CE|PE)",
-            up,
-        )
-
-        if not m:
-            return None
-
-        valid = []
-
-        for sym, strike, ot in m:
-
-            strike = int(strike)
-
-            if not self.strike_ok(sym, strike):
-                continue
-
-            valid.append(
-                (
-                    sym,
-                    strike,
-                    trade_option_type(ot),
-                )
-            )
-
-        return valid[-1] if valid else None
 
     # =====================
 
@@ -767,17 +590,24 @@ class Engine:
 
             if fut and lots is not None:
                 symbol = fut.group(1)
+                is_index = symbol in INDEX_SYMBOLS
                 threshold = (
                     CROR_INDEX_FUT_LOTS
-                    if symbol in INDEX_SYMBOLS
+                    if is_index
                     else CROR_STOCK_FUT_LOTS
                 )
 
                 if lots >= threshold:
+                    if (
+                        not is_index
+                        and action not in {"BUYER", "WRITER"}
+                    ):
+                        continue
+
                     signal_ot = None
                     if action in {"SHORT COVERING", "FUT BUY", "BUY", "BUYER"}:
                         signal_ot = "CE"
-                    elif action in {"UNWINDING", "FUT SELL", "SELL"}:
+                    elif action in {"UNWINDING", "FUT SELL", "SELL", "WRITER"}:
                         signal_ot = "PE"
 
                     alerts.append(
@@ -791,138 +621,27 @@ class Engine:
                             "fut_price": fut_price,
                             "turnover": turnover,
                             "threshold": threshold,
+                            "trade_mode": "INDEX_OPTION" if is_index else "STOCK_SPOT",
                         }
                     )
 
         return alerts
 
-    def cror_alert_text(self, a):
-        if a["kind"] == "FUTURE":
-            extra = ""
-            if a.get("signal_ot"):
-                side = "CALL" if a["signal_ot"] == "CE" else "PUT"
-                extra = f"\nSIGNAL: ATM {side}"
-            return (
-                f"CROR FUTURE ALERT\n"
-                f"{a['symbol']} FUT {a['action']}\n"
-                f"LOTS: {a['lots']} >= {a['threshold']}\n"
-                f"TURNOVER: {a['turnover']} Cr\n"
-                f"PRICE: {a['price']}"
-                f"{extra}"
-            )
-
-        side = "CALL" if a["signal_ot"] == "CE" else "PUT"
+    def short_cror_source(self, a):
+        action_code = {
+            "SHORT COVERING": "S_C",
+            "WRITER": "WR",
+            "BUYER": "BUY",
+        }.get(a["action"], a["action"].replace(" ", "_"))
+        moneyness = re.sub(
+            r"-[\d.]+-DIFF$",
+            "",
+            str(a.get("moneyness", "")),
+            flags=re.IGNORECASE,
+        ).lower()
         return (
-            f"{a['symbol']} {a['strike']} {a['option_type']} {a['moneyness']}\n"
-            f"ACTION: {a['action']} LOTS: {a['lots']} >= {a['threshold']}"
-        )
-
-    # =====================
-
-    def signal_source(self, text):
-
-        up = text.upper()
-
-        if "STANDARD BALANCED FLOW" in up:
-            return "STANDARD BALANCED FLOW"
-
-        if "DIRECT: AGGRESSIVE OTM WRITER" in up:
-            return "DIRECT: AGGRESSIVE OTM WRITER"
-
-        if "DIRECT: AGGRESSIVE OTM SHORT COVERING" in up:
-            return "DIRECT: AGGRESSIVE OTM SHORT COVERING"
-
-        if "DIRECT: AGGRESSIVE ITM WRITER" in up:
-            return "DIRECT: AGGRESSIVE ITM WRITER"
-
-        if "DIRECT: AGGRESSIVE ITM SHORT COVERING" in up:
-            return "DIRECT: AGGRESSIVE ITM SHORT COVERING"
-
-        if "FULL 2MIN FAST ITM WRITING" in up:
-            return "FULL 2MIN FAST ITM WRITING"
-
-        if "FULL 2MIN ITM WRITING" in up:
-            return "FULL 2MIN ITM WRITING"
-
-        if "FULL 2MIN OPTION+FUTURE" in up:
-            return "FULL 2MIN OPTION+FUTURE"
-
-        if "INSTITUTIONAL FULL" in up:
-            return "INSTITUTIONAL FULL"
-
-        if "INSTITUTIONAL DUAL MATCH" in up:
-            return "INSTITUTIONAL DUAL MATCH"
-
-        return None
-
-    # =====================
-
-    def parse_exit(self, text):
-
-        up = text.upper()
-
-        pat = "|".join(
-            sorted(
-                SUPPORTED,
-                key=len,
-                reverse=True,
-            )
-        )
-
-        m = re.search(
-            rf"EXIT\s+({pat})\b",
-            up,
-        )
-
-        if not m:
-            return None
-
-        pending = None
-
-        pm = re.search(
-            rf"PENDING:\s*BUY\s+({pat})\s+(\d{{4,6}})\s*(CE|PE)",
-            up,
-        )
-
-        if pm:
-            pending = (
-                pm.group(1),
-                int(pm.group(2)),
-                trade_option_type(pm.group(3)),
-            )
-
-        return m.group(1), pending
-
-    # =====================
-
-    def parse_cancel(self, text):
-
-        up = text.upper()
-
-        if "REVERSE CANCELLED" not in up:
-            return None
-
-        pat = "|".join(
-            sorted(
-                SUPPORTED,
-                key=len,
-                reverse=True,
-            )
-        )
-
-        pm = re.search(
-            rf"PENDING:\s*BUY\s+({pat})\s+(\d{{4,6}})\s*(CE|PE)",
-            up,
-        )
-
-        if not pm:
-            return "🚫 REVERSE CANCELLED"
-
-        return (
-            "🚫 REVERSE CANCELLED\n\n"
-            f"PENDING: BUY {pm.group(1)} "
-            f"{int(pm.group(2))} {trade_option_type(pm.group(3))}\n"
-            "REASON: NEXT 2MIN FLOW NOT CONFIRMED"
+            f"{action_code} {a['option_type']}-{moneyness} "
+            f"{a['lots']}lots"
         )
 
     # =====================
@@ -949,9 +668,9 @@ class Engine:
         df = self.df[
             (self.df.name == u)
             & (
-                self.df.symbol.str.contains(
-                    f"{s}{ot}",
-                    regex=False,
+                self.df.symbol.astype(str).str.match(
+                    rf"^{re.escape(u)}\d{{2}}[A-Z]{{3}}{int(s)}{ot}$",
+                    na=False,
                 )
             )
         ]
@@ -969,6 +688,86 @@ class Engine:
             row.exch_seg,
             int(float(row.get("lotsize", LOT_SIZES.get(u, 1)))),
         )
+
+    def resolve_spot(self, u):
+        if self.spot_df is None:
+            raise RuntimeError("SPOT MASTER NOT LOADED")
+
+        rows = self.spot_df[
+            (self.spot_df.name.astype(str) == u)
+            | (self.spot_df.symbol.astype(str) == f"{u}-EQ")
+        ]
+        if rows.empty:
+            raise RuntimeError(f"SPOT SCRIP NOT FOUND: {u}")
+
+        row = rows.iloc[0]
+        return row.symbol, row.token, row.exch_seg
+
+    def resolve_future(self, u):
+        rows = self.df[
+            (self.df.name == u)
+            & self.df.symbol.astype(str).str.match(
+                rf"^{re.escape(u)}\d{{2}}[A-Z]{{3}}FUT$",
+                na=False,
+            )
+        ]
+        if rows.empty:
+            raise RuntimeError(f"FUTURE SCRIP NOT FOUND: {u}")
+
+        row = rows.sort_values("expiry").iloc[0]
+        return row.symbol, row.token, row.exch_seg
+
+    async def confirm_reverse_after_wait(
+        self,
+        u,
+        direction,
+        reference_future_price,
+        signal_source,
+        strike=None,
+        stock_mode=False,
+    ):
+        await asyncio.sleep(REVERSE_WAIT_SECONDS)
+
+        try:
+            if u in self.trades:
+                return
+
+            symbol, token, exchange = self.resolve_future(u)
+            current_future_price = self.ltp(exchange, symbol, token)
+            aligned = (
+                current_future_price > reference_future_price
+                if direction in {"CE", "BUY"}
+                else current_future_price < reference_future_price
+            )
+            if not aligned:
+                return
+
+            self.reverse_wait_until.pop(u, None)
+            source = (
+                f"{signal_source} | 1MIN FUT CONFIRMED "
+                f"{reference_future_price:.2f}->{current_future_price:.2f}"
+            )
+            if stock_mode:
+                trade, msgs = self.stock_signal(
+                    u,
+                    direction,
+                    source,
+                )
+            else:
+                trade, msgs = self.signal(
+                    u,
+                    strike,
+                    direction,
+                    False,
+                    source,
+                )
+
+            for msg in msgs:
+                tg(msg)
+            if trade:
+                tg(fmt(trade))
+        except Exception as e:
+            print(f"REVERSE CONFIRM ERROR {u}: {safe(e)}")
 
     # =====================
 
@@ -1041,12 +840,15 @@ class Engine:
 
     # =====================
 
-    def real_entry_block_reason(self, u):
+    def real_entry_block_reason(self, u, instrument_kind="OPTION"):
 
         if not REAL_TRADE_ENABLED:
             return "REAL_TRADE_ENABLED=false"
 
-        if u not in REAL_ALLOWED_UNDERLYINGS:
+        if (
+            instrument_kind != "STOCK"
+            and u not in REAL_ALLOWED_UNDERLYINGS
+        ):
             return f"{u} not in REAL_ALLOWED_UNDERLYINGS"
 
         self.reset_real_day()
@@ -1267,7 +1069,7 @@ class Engine:
         step = trade_step(u)
         # CE and PE are both long option-premium trades. Profit happens when
         # the bought option premium rises.
-        sl = price - step
+        sl = max(0.05, price - step)
         targets = [price + step * i for i in range(1, MAX_TARGET + 1)]
 
         return Trade(
@@ -1284,8 +1086,38 @@ class Engine:
             targets=targets,
 
             qty=lot_size,
+            side="BUY",
+            instrument_kind="OPTION",
             high_price=price,
             is_reverse=is_reverse,
+            signal_source=signal_source,
+        )
+
+    def create_stock_trade(self, u, side, signal_source=None):
+        sym, token, ex = self.resolve_spot(u)
+        price = self.ltp(ex, sym, token)
+
+        if side == "BUY":
+            sl = price - STOCK_MIS_SL_POINTS
+            targets = [price + STOCK_MIS_TARGET_POINTS]
+        else:
+            sl = price + STOCK_MIS_SL_POINTS
+            targets = [price - STOCK_MIS_TARGET_POINTS]
+
+        return Trade(
+            underlying=u,
+            strike=0,
+            option_type="MIS",
+            symbol=sym,
+            token=token,
+            exchange=ex,
+            entry=price,
+            sl=sl,
+            targets=targets,
+            qty=STOCK_MIS_QTY,
+            side=side,
+            instrument_kind="STOCK",
+            high_price=price,
             signal_source=signal_source,
         )
 
@@ -1310,6 +1142,14 @@ class Engine:
 
         return None
 
+    def trade_label(self, trade):
+        if trade.instrument_kind == "STOCK":
+            return f"{trade.underlying} MIS {trade.side}"
+        return (
+            f"{trade.underlying} {trade.strike} "
+            f"{trade.option_type}"
+        )
+
     # =====================
 
     def close_trade(self, trade, reason, price):
@@ -1328,9 +1168,10 @@ class Engine:
 
         try:
 
+            exit_side = "SELL" if trade.side == "BUY" else "BUY"
             oid = self.real_order(
                 trade,
-                "SELL",
+                exit_side,
                 price,
             )
 
@@ -1338,9 +1179,7 @@ class Engine:
             trade.real_open = False
 
             msgs.append(
-                f"✅ REAL SELL {trade.underlying} "
-                f"{trade.strike} "
-                f"{trade.option_type} "
+                f"REAL {exit_side} {trade.underlying} "
                 f"@ {price:.2f} "
                 f"({reason}) "
                 f"ORDER: {oid}"
@@ -1364,55 +1203,6 @@ class Engine:
 
     # =====================
 
-    def exit_only(self, u, pending):
-
-        msgs = []
-        active = self.trades.get(u)
-
-        if active:
-
-            ok, exit_msgs = self.close_trade(
-                active,
-                "REVERSE EXIT ONLY",
-                None,
-            )
-
-            msgs.extend(exit_msgs)
-
-            if not ok:
-                return msgs
-
-            msgs.append(
-                f"🔄 {u} OLD "
-                f"{active.strike} "
-                f"{active.option_type} "
-                f"EXITED\n"
-                f"REASON: REVERSE EXIT ONLY"
-            )
-
-            del self.trades[u]
-
-        else:
-
-            msgs.append(
-                f"⚠️ {u} REVERSE EXIT ONLY\n"
-                f"NO ACTIVE TRADE"
-            )
-
-        if pending:
-
-            pu, ps, pot = pending
-
-            msgs.append(
-                f"⏳ PENDING: BUY {pu} "
-                f"{ps} {pot}\n"
-                f"WAIT: NEXT 2MIN CONFIRMATION"
-            )
-
-        return msgs
-
-    # =====================
-
     def signal(
         self,
         u,
@@ -1420,231 +1210,297 @@ class Engine:
         ot,
         reverse_confirmed=False,
         signal_source=None,
+        reference_future_price=None,
     ):
-
         msgs = []
-        entry_block_reason = self.paper_entry_block_reason()
+        now = datetime.now(IST)
+
+        if self.paper_entry_block_reason():
+            return None, msgs
+
+        if now < self.reverse_wait_until.get(u, now):
+            return None, msgs
 
         active = self.trades.get(u)
-        active_opposite = False
-
         if active:
-
-            if active.option_type == ot:
-                msgs.append(
-                    f"🚀💥 {u} SAME DIRECTION SIGNAL AGAIN\n"
-                    f"ACTIVE: {active.strike} {active.option_type} | "
-                    f"NEW: {s} {ot}\n"
-                    f"READY TO FLY / STRONG MOVEMENT"
-                )
+            if (
+                active.instrument_kind == "OPTION"
+                and active.option_type == ot
+            ):
                 return None, msgs
 
-            active_opposite = True
-
+            exit_price = self.ltp(
+                active.exchange,
+                active.symbol,
+                active.token,
+            )
             ok, exit_msgs = self.close_trade(
                 active,
-                (
-                    "REVERSE CONFIRMED OLD EXIT"
-                    if reverse_confirmed
-                    else "REVERSE EXIT ONLY"
-                ),
-                None,
+                "REVERSE SIGNAL",
+                exit_price,
             )
-
             msgs.extend(exit_msgs)
-
             if not ok:
                 return None, msgs
 
-            msgs.append(
-                f"🔄 {u} OLD "
-                f"{active.strike} "
-                f"{active.option_type} "
-                f"EXITED ON "
-                f"{'REVERSE CONFIRMED' if reverse_confirmed else 'REVERSE EXIT ONLY'}"
+            label = (
+                f"{active.strike} {active.option_type}"
+                if active.instrument_kind == "OPTION"
+                else f"MIS {active.side}"
             )
-
+            msgs.append(
+                f"{u} {label} EXIT @ {exit_price:.2f} | "
+                f"REVERSE {ot}, WAIT 1 MIN"
+            )
             del self.trades[u]
-
-            if not reverse_confirmed:
-                msgs.append(
-                    f"⏳ PENDING: BUY {u} {s} {ot}\n"
-                    f"WAIT: NEXT 2MIN CONFIRMATION"
-                )
-                return None, msgs
-
-            if entry_block_reason:
-                msgs.append(
-                    f"⏱️ PAPER ENTRY BLOCKED\n"
-                    f"{u} {s} {ot}\n"
-                    f"REASON: {entry_block_reason}"
-                )
-                return None, msgs
-
-        key = f"{u}_{s}_{ot}"
-
-        if entry_block_reason:
-            msgs.append(
-                f"⏱️ PAPER ENTRY BLOCKED\n"
-                f"{u} {s} {ot}\n"
-                f"REASON: {entry_block_reason}"
+            self.reverse_wait_until[u] = now + timedelta(
+                seconds=REVERSE_WAIT_SECONDS
             )
+            if reference_future_price is not None:
+                asyncio.create_task(
+                    self.confirm_reverse_after_wait(
+                        u,
+                        ot,
+                        float(reference_future_price),
+                        signal_source or "REVERSE",
+                        strike=s,
+                    )
+                )
             return None, msgs
 
-        if not active_opposite and self.dup(key):
-
-            print("DUP SIGNAL")
-
-            msgs.append(
-                f"🚀💥 {u} {s} {ot} "
-                f"SAME DIRECTION REPEAT SIGNAL\n"
-                f"READY TO FLY / STRONG MOVEMENT"
-            )
-
+        key = f"{u}_{s}_{ot}"
+        if self.dup(key):
             return None, msgs
 
         trade = self.create_trade(
             u,
             s,
             ot,
-            reverse_confirmed,
+            False,
             signal_source,
         )
-
-        # PAPER TRADE FIRST
-
         self.trades[u] = trade
-
-        print("PAPER TRADE CREATED")
-
-        # REAL TRADE
+        print("PAPER OPTION TRADE CREATED")
 
         if REAL_TRADE_ENABLED:
-
             try:
-
-                reason = self.real_entry_block_reason(u)
-
+                reason = self.real_entry_block_reason(
+                    u,
+                    trade.instrument_kind,
+                )
                 if reason:
                     raise RuntimeError(reason)
-
                 oid = self.real_order(
                     trade,
-                    "BUY",
+                    trade.side,
                     trade.entry,
                 )
-
                 trade.order_id = oid
                 trade.real_open = True
                 self.real_entries_today += 1
-
             except Exception as e:
-
                 trade.real_error = safe(e)
+                print(f"REAL FAIL: {safe(e)}")
 
-                print(
-                    f"REAL FAIL: {safe(e)}"
+        return trade, msgs
+
+    def stock_signal(
+        self,
+        u,
+        side,
+        signal_source=None,
+        reference_future_price=None,
+    ):
+        msgs = []
+        now = datetime.now(IST)
+
+        if self.paper_entry_block_reason():
+            return None, msgs
+
+        if now < self.reverse_wait_until.get(u, now):
+            return None, msgs
+
+        active = self.trades.get(u)
+        if active:
+            if (
+                active.instrument_kind == "STOCK"
+                and active.side == side
+            ):
+                return None, msgs
+
+            exit_price = self.ltp(
+                active.exchange,
+                active.symbol,
+                active.token,
+            )
+            ok, exit_msgs = self.close_trade(
+                active,
+                "REVERSE SIGNAL",
+                exit_price,
+            )
+            msgs.extend(exit_msgs)
+            if not ok:
+                return None, msgs
+
+            label = (
+                f"{active.strike} {active.option_type}"
+                if active.instrument_kind == "OPTION"
+                else f"MIS {active.side}"
+            )
+            msgs.append(
+                f"{u} {label} EXIT @ {exit_price:.2f} | "
+                f"REVERSE {side}, WAIT 1 MIN"
+            )
+            del self.trades[u]
+            self.reverse_wait_until[u] = now + timedelta(
+                seconds=REVERSE_WAIT_SECONDS
+            )
+            if reference_future_price is not None:
+                asyncio.create_task(
+                    self.confirm_reverse_after_wait(
+                        u,
+                        side,
+                        float(reference_future_price),
+                        signal_source or "REVERSE",
+                        stock_mode=True,
+                    )
                 )
+            return None, msgs
+
+        if self.dup(f"STOCK_{u}_{side}"):
+            return None, msgs
+
+        trade = self.create_stock_trade(
+            u,
+            side,
+            signal_source=signal_source,
+        )
+        self.trades[u] = trade
+        print("PAPER STOCK MIS TRADE CREATED")
+
+        if REAL_TRADE_ENABLED:
+            try:
+                reason = self.real_entry_block_reason(
+                    u,
+                    trade.instrument_kind,
+                )
+                if reason:
+                    raise RuntimeError(reason)
+                oid = self.real_order(
+                    trade,
+                    trade.side,
+                    trade.entry,
+                )
+                trade.order_id = oid
+                trade.real_open = True
+                self.real_entries_today += 1
+            except Exception as e:
+                trade.real_error = safe(e)
+                print(f"REAL FAIL: {safe(e)}")
 
         return trade, msgs
 
     # =====================
 
     def update(self):
-
         msgs = []
 
         if (
-            datetime.now(IST).time()
-            >= hhmm(PAPER_TRADE_STOP_TIME)
+            datetime.now(IST).time() >= hhmm(PAPER_TRADE_STOP_TIME)
             and self.trades
         ):
-
-            for u, t in list(self.trades.items()):
-
+            for u, trade in list(self.trades.items()):
                 try:
-                    p = self.ltp(
-                        t.exchange,
-                        t.symbol,
-                        t.token,
+                    price = self.ltp(
+                        trade.exchange,
+                        trade.symbol,
+                        trade.token,
                     )
-                    msgs.append(
-                        f"⏰ {u} PAPER CUTOFF EXIT\n"
-                        f"TIME: {PAPER_TRADE_STOP_TIME}\n"
-                        f"EXIT @ {p:.2f}"
-                    )
-                except Exception as e:
-                    p = None
-                    msgs.append(
-                        f"⏰ {u} PAPER CUTOFF EXIT\n"
-                        f"TIME: {PAPER_TRADE_STOP_TIME}\n"
-                        f"LTP ERROR: {safe(e)}"
-                    )
-
-                try:
                     ok, exit_msgs = self.close_trade(
-                        t,
+                        trade,
                         f"PAPER CUTOFF {PAPER_TRADE_STOP_TIME}",
-                        p,
+                        price,
                     )
-
                     msgs.extend(exit_msgs)
-
                     if ok:
+                        msgs.append(
+                            f"{self.trade_label(trade)} "
+                            f"EXIT @ {price:.2f} | "
+                            f"CUTOFF {PAPER_TRADE_STOP_TIME}"
+                        )
                         del self.trades[u]
-
                 except Exception as e:
-                    msgs.append(
-                        f"⚠️ {u} PAPER CUTOFF EXIT FAILED: {safe(e)}"
-                    )
-
+                    print(f"CUTOFF EXIT ERROR {u}: {safe(e)}")
             return msgs
 
-        for u, t in list(self.trades.items()):
-
+        for u, trade in list(self.trades.items()):
             try:
-
-                p = self.ltp(
-                    t.exchange,
-                    t.symbol,
-                    t.token,
+                price = self.ltp(
+                    trade.exchange,
+                    trade.symbol,
+                    trade.token,
                 )
 
-                # SL
-                is_sl_hit = p <= t.sl
-
-                if is_sl_hit:
-                    msgs.append(f"❌ {u} TRAILING SL HIT @ {p:.2f}")
-                    ok, exit_msgs = self.close_trade(t, "TRAILING SL HIT", p)
+                sl_hit = (
+                    price <= trade.sl
+                    if trade.side == "BUY"
+                    else price >= trade.sl
+                )
+                if sl_hit:
+                    ok, exit_msgs = self.close_trade(
+                        trade,
+                        "SL HIT",
+                        price,
+                    )
                     msgs.extend(exit_msgs)
                     if ok:
+                        msgs.append(
+                            f"{self.trade_label(trade)} "
+                            f"SL HIT @ {price:.2f} | "
+                            f"ENTRY {trade.entry:.2f}"
+                        )
                         del self.trades[u]
                     continue
-                
-                # Check for Trailing SL update (if any momentum-based trailing exists, but here we use target-based)
-                # trail = self.trail_sl(t) # Called inside target logic below
 
-                # TARGET
                 closed = False
-                while (
-                    t.target_hit < len(t.targets)
-                    and p >= t.targets[t.target_hit]
-                ):
-                    t.target_hit += 1
-                    target_no = t.target_hit
-                    msgs.append(f"🎯 {u} T{target_no} HIT @ {p:.2f}")
+                while trade.target_hit < len(trade.targets):
+                    target = trade.targets[trade.target_hit]
+                    target_hit = (
+                        price >= target
+                        if trade.side == "BUY"
+                        else price <= target
+                    )
+                    if not target_hit:
+                        break
 
-                    # SL shift every target hit right
-                    trail_res = self.trail_sl(t)
-                    if trail_res:
-                        old_sl, new_sl = trail_res
-                        msgs.append(f"🛡️ {u} SL MOVED: {old_sl:.2f} -> {new_sl:.2f}")
+                    trade.target_hit += 1
+                    target_no = trade.target_hit
+                    msgs.append(
+                        f"{self.trade_label(trade)} "
+                        f"T{target_no} HIT @ {price:.2f}"
+                    )
 
-                    if target_no >= MAX_TARGET:
-                        msgs.append(f"🏁 {u} FINAL TARGET REACHED. EXITING.")
-                        ok, exit_msgs = self.close_trade(t, f"T{target_no} HIT", p)
+                    if trade.instrument_kind == "OPTION":
+                        trail_result = self.trail_sl(trade)
+                        if trail_result:
+                            old_sl, new_sl = trail_result
+                            msgs.append(
+                                f"{self.trade_label(trade)} "
+                                f"SL {old_sl:.2f} -> {new_sl:.2f}"
+                            )
+
+                    if target_no >= len(trade.targets):
+                        ok, exit_msgs = self.close_trade(
+                            trade,
+                            f"T{target_no} HIT",
+                            price,
+                        )
                         msgs.extend(exit_msgs)
                         if ok:
+                            msgs.append(
+                                f"{self.trade_label(trade)} "
+                                f"EXIT @ {price:.2f} | TARGET"
+                            )
                             del self.trades[u]
                             closed = True
                         break
@@ -1652,41 +1508,26 @@ class Engine:
                 if closed:
                     continue
 
-                # TIME EXIT (3 MIN NO REACTION)
-                # If price hasn't moved at least 30 pts (T1) in 3 minutes, cut the trade.
-                if (
-                    datetime.now(IST) - t.opened_at >= timedelta(seconds=NO_T1_EXIT_SECONDS)
-                    and t.high_price < t.targets[0]
-                ):
+                alert_step = (
+                    STOCK_PRICE_ALERT_STEP
+                    if trade.instrument_kind == "STOCK"
+                    else OPTION_PRICE_ALERT_STEP
+                )
+                favorable_move = (
+                    price >= trade.high_price + alert_step
+                    if trade.side == "BUY"
+                    else price <= trade.high_price - alert_step
+                )
+                if favorable_move:
+                    trade.high_price = price
+                    trade.last_alert = price
                     msgs.append(
-                        f"⚠️ {u} NO REACTION EXIT\n\n"
-                        f"Price failed to reach T1 within 3 minutes.\n"
-                        f"EXIT @ {p:.2f}"
-                    )
-                    ok, exit_msgs = self.close_trade(t, "NO T1 3 MIN", p)
-                    msgs.extend(exit_msgs)
-                    if ok:
-                        del self.trades[u]
-                    continue
-                    
-                # PRICE
-                new_fav = False
-                if p > t.high_price:
-                    t.high_price = p
-                    new_fav = True
-
-                if new_fav:
-                    t.last_alert = p
-                    msgs.append(
-                        f"📈 {u} "
-                        f"PRICE {p:.2f}"
+                        f"{self.trade_label(trade)} "
+                        f"PRICE {price:.2f}"
                     )
 
             except Exception as e:
-
-                print(
-                    f"UPDATE ERROR: {safe(e)}"
-                )
+                print(f"UPDATE ERROR: {safe(e)}")
 
         return msgs
 
@@ -1701,38 +1542,26 @@ engine = Engine()
 # =========================
 
 def fmt(t):
+    if t.instrument_kind == "STOCK":
+        return (
+            f"{t.underlying} MIS {t.side} {t.qty} QTY\n"
+            f"ENTRY: {t.entry:.2f}\n"
+            f"SL: {t.sl:.2f}\n"
+            f"TARGET: {t.targets[0]:.2f}"
+        )
 
-    x = [
-        f"🔥 {t.underlying} "
-        f"{t.strike} "
-        f"{t.option_type}",
-        "",
-        f"📍 ENTRY: {t.entry:.2f}",
-        f"🛡️ SL: {t.sl:.2f}",
-        f"🎯 T1: {t.targets[0]:.2f}",
-        f"🎯 T2: {t.targets[1]:.2f}",
-        f"🎯 T3: {t.targets[2]:.2f}",
-        f"🎯 T4: {t.targets[3]:.2f}",
-        f"🎯 T5: {t.targets[4]:.2f}",
+    lines = [
+        f"{t.underlying} {t.strike} {t.option_type}",
+        f"ENTRY: {t.entry:.2f}",
+        f"SL: {t.sl:.2f}",
     ]
-
-    if t.is_reverse:
-        x.extend(
-            [
-                "",
-                "✅ REVERSE CONFIRMED NEXT 2MIN",
-            ]
-        )
-
+    lines.extend(
+        f"T{index}: {target:.2f}"
+        for index, target in enumerate(t.targets, 1)
+    )
     if t.signal_source:
-        x.extend(
-            [
-                "",
-                f"SIGNAL SOURCE: {t.signal_source}",
-            ]
-        )
-
-    return "\n".join(x)
+        lines.append(t.signal_source)
+    return "\n".join(lines)
 
 # =========================
 # MONITOR
@@ -1813,32 +1642,44 @@ async def main():
             cror_alerts = engine.parse_cror_alerts(text)
             if cror_alerts:
                 for a in cror_alerts:
-                    tg(engine.cror_alert_text(a))
-
                     if a["kind"] == "FUTURE":
                         symbol = a["symbol"]
-                        if not a.get("signal_ot"):
-                            tg(
-                                f"CROR FUTURE TRADE SKIPPED\n"
-                                f"{symbol} FUT {a['action']} has no CALL/PUT direction"
+                        if a.get("trade_mode") == "STOCK_SPOT":
+                            side = "BUY" if a["action"] == "BUYER" else "SELL"
+                            source = (
+                                f"{a['action'].replace(' ', '_')} "
+                                f"{a['lots']}lots"
                             )
+                            trade, msgs = engine.stock_signal(
+                                symbol,
+                                side,
+                                source,
+                                reference_future_price=a.get("fut_price"),
+                            )
+                            for msg in msgs:
+                                tg(msg)
+                            if trade:
+                                tg(fmt(trade))
+                            continue
+
+                        if not a.get("signal_ot"):
                             continue
 
                         if not a.get("fut_price"):
-                            tg(
-                                f"CROR FUTURE TRADE SKIPPED\n"
-                                f"{symbol} FUT missing Fut Price for ATM strike"
-                            )
                             continue
 
-                        trade_strike = engine.get_atm(a["fut_price"], symbol)
+                        trade_strike = engine.get_atm(
+                            a["fut_price"],
+                            symbol,
+                            a["signal_ot"],
+                        )
                         signal_desc = (
                             f"{symbol} ATM {trade_strike} {a['signal_ot']} "
                             f"(CROR FUT {a['action']} {a['lots']} lots)"
                         )
                         source = (
-                            f"CROR FUT {a['action']} {a['lots']} lots "
-                            f"ATM from Fut Price {a['fut_price']}"
+                            f"{a['action'].replace(' ', '_')} "
+                            f"{a['lots']}lots"
                         )
                         trade, msgs = engine.signal(
                             symbol,
@@ -1846,6 +1687,7 @@ async def main():
                             a["signal_ot"],
                             False,
                             source,
+                            reference_future_price=a["fut_price"],
                         )
                         for msg in msgs:
                             tg(msg)
@@ -1855,54 +1697,37 @@ async def main():
 
                     symbol = a["symbol"]
                     if not a.get("fut_price"):
-                        tg(
-                            f"CROR TRADE SKIPPED\n"
-                            f"{symbol} {a['strike']} {a['option_type']} missing Fut Price for ATM strike"
-                        )
                         continue
 
-                    trade_strike = engine.get_atm(a["fut_price"], symbol)
+                    trade_strike = engine.get_atm(
+                        a["fut_price"],
+                        symbol,
+                        a["signal_ot"],
+                    )
 
                     if not engine.strike_ok(symbol, trade_strike):
-                        tg(
-                            f"CROR TRADE SKIPPED\n"
-                            f"{symbol} ATM {trade_strike} strike out of allowed range"
-                        )
                         continue
 
                     active = engine.trades.get(symbol)
                     if not a["entry_allowed"]:
                         if not active:
-                            tg(
-                                f"CROR ENTRY SKIPPED\n"
-                                f"{symbol} {a['strike']} {a['option_type']} is NEAR-ITM\n"
-                                f"RULE: NEAR-ITM is exit-only"
-                            )
                             continue
 
                         if active.option_type == a["signal_ot"]:
-                            tg(
-                                f"CROR EXIT CHECK - NO ACTION\n"
-                                f"{symbol} active {active.option_type}, signal {a['signal_ot']}\n"
-                                f"RULE: NEAR-ITM exits only on opposite signal"
-                            )
                             continue
 
                     signal_desc = (
                         f"{symbol} ATM {trade_strike} {a['signal_ot']} "
                         f"(CROR {a['action']} {a['lots']} lots)"
                     )
-                    source = (
-                        f"CROR {a['action']} {a['lots']} lots "
-                        f"on {a['option_type']} {a['moneyness']} "
-                        f"ATM from Fut Price {a['fut_price']}"
-                    )
+                    source = engine.short_cror_source(a)
                     trade, msgs = engine.signal(
                         symbol,
                         trade_strike,
                         a["signal_ot"],
                         False,
                         source,
+                        reference_future_price=a["fut_price"],
                     )
                     for msg in msgs:
                         tg(msg)
@@ -1910,160 +1735,6 @@ async def main():
                         tg(fmt(trade))
 
                 return
-
-            # =====================
-            # FLOW SIGNAL DETECTION
-            # =====================
-            if "2 MIN" in text.upper() or "5 MIN" in text.upper():
-                lbl = "2 MIN FLOW" if "2 MIN" in text.upper() else "5 MIN FLOW"
-                short_lbl = "2MIN" if "2 MIN" in text.upper() else "5MIN"
-
-                for symbol in SUPPORTED:
-                    section = engine.extract_instrument_section(text, symbol)
-                    if not section: continue
-
-                    # Update Price History for Momentum check
-                    price = engine.get_future_price(section, symbol)
-                    if price: engine.update_price_history(symbol, price)
-
-                    # 1. FUTURES LOT MATCH (2MIN only)
-                    if short_lbl == "2MIN":
-                        m = re.search(r"(FUT_BUY|FUT_SELL)\s*:\s*(\d+)\s+lots", section, re.IGNORECASE)
-                        if m and int(m.group(2)) >= FUT_LOT_THRESHOLD:
-                            sig_fut = "CALL" if m.group(1).upper() == "FUT_BUY" else "PUT"
-                            strike = engine.get_atm(price, symbol) if price else None
-                            if strike:
-                                # Apply Momentum Filter
-                                m_ok, m_reason = engine.check_momentum(symbol, sig_fut)
-                                if m_ok:
-                                    trade, msgs = engine.signal(symbol, strike, "CE" if sig_fut == "CALL" else "PE", False, f"{short_lbl} FUT LOTS >= {FUT_LOT_THRESHOLD}")
-                                    for msg in msgs: tg(msg)
-                                    if trade: tg(fmt(trade))
-                                else:
-                                    tg(f"⏳ MOMENTUM WAIT: {symbol} {sig_fut} (FUT LOTS)\nReason: {m_reason}. Re-checking in 60s...")
-                                    asyncio.create_task(engine.delayed_momentum_signal(symbol, strike, "CE" if sig_fut == "CALL" else "PE", f"{short_lbl} FUT LOTS", price, tg, fmt))
-                                continue
-
-                    # 2. ITM WRITER ALERT (2MIN only)
-                    metrics = engine.parse_flow_metrics(section)
-                    if not metrics: continue
-
-                    if short_lbl == "2MIN":
-                        bullish_triggers = []
-                        bearish_triggers = []
-                        if metrics["put_itm"] >= ITM_WRITER_THRESHOLD_CR:
-                            bullish_triggers.append(("PUT_WR", metrics["put_itm"]))
-                        if metrics["call_sc_itm"] >= ITM_SC_THRESHOLD_CR:
-                            bullish_triggers.append(("CALL_SC", metrics["call_sc_itm"]))
-                        if metrics["call_itm"] >= ITM_WRITER_THRESHOLD_CR:
-                            bearish_triggers.append(("CALL_WR", metrics["call_itm"]))
-                        if metrics["put_sc_itm"] >= ITM_SC_THRESHOLD_CR:
-                            bearish_triggers.append(("PUT_SC", metrics["put_sc_itm"]))
-
-                        alert_side = None
-                        if bullish_triggers and not bearish_triggers: alert_side = "CALL"
-                        elif bearish_triggers and not bullish_triggers: alert_side = "PUT"
-
-                        if alert_side:
-                            label, val = max(bullish_triggers if alert_side == "CALL" else bearish_triggers, key=lambda x: x[1])
-                            akey = f"{symbol}_{alert_side}_{label}_{now.strftime('%H:%M')}"
-                            if akey not in engine.instant_itm_alerts:
-                                engine.instant_itm_alerts[akey] = now
-                                strike = engine.get_atm(price, symbol) if price else None
-                                if strike:
-                                    m_ok, m_reason = engine.check_momentum(symbol, alert_side)
-                                    if m_ok:
-                                        trade, msgs = engine.signal(symbol, strike, "CE" if alert_side == "CALL" else "PE", False, f"2MIN ITM {label} {val:.2f}Cr")
-                                        for msg in msgs: tg(msg)
-                                        if trade: tg(fmt(trade))
-                                    else:
-                                        tg(f"⏳ MOMENTUM WAIT: {symbol} {alert_side} (ITM WRITER)\nReason: {m_reason}. Re-checking in 60s...")
-                                        asyncio.create_task(engine.delayed_momentum_signal(symbol, strike, "CE" if alert_side == "CALL" else "PE", f"2MIN ITM {label}", price, tg, fmt))
-                                    continue
-
-                    # 3. DUAL MATCH
-                    sig_type = None
-                    if symbol in ("BANKNIFTY", "NIFTY"):
-                        m_turn, m_itm = engine.get_dual_match_thresholds(symbol, short_lbl, now)
-                        if metrics["bull_t"] >= m_turn and metrics["put_itm"] >= m_itm and metrics["bear_t"] < 1.0: sig_type = "CALL"
-                        elif metrics["bear_t"] >= m_turn and metrics["call_itm"] >= m_itm and metrics["bull_t"] < 1.0: sig_type = "PUT"
-                    else:
-                        if short_lbl == "2MIN":
-                            if metrics["bull_t"] >= 6.0 and metrics["put_itm"] >= 3.5 and metrics["bear_t"] < 1.0: sig_type = "CALL"
-                            elif metrics["bear_t"] >= 6.0 and metrics["call_itm"] >= 3.5 and metrics["bull_t"] < 1.0: sig_type = "PUT"
-                        else:
-                            if metrics["bull_t"] >= 1.0 and metrics["put_itm"] < 1.0 and metrics["bear_t"] < 1.0: sig_type = "CALL"
-                            elif metrics["bear_t"] >= 1.0 and metrics["call_itm"] < 1.0 and metrics["bull_t"] < 1.0: sig_type = "PUT"
-
-                    if sig_type:
-                        if symbol not in engine.last_signals_by_symbol:
-                            engine.last_signals_by_symbol[symbol] = {"2 MIN FLOW": None, "5 MIN FLOW": None}
-                        engine.last_signals_by_symbol[symbol][lbl] = {"type": sig_type, "time": now}
-                        other_lbl = "5 MIN FLOW" if short_lbl == "2MIN" else "2 MIN FLOW"
-                        other = engine.last_signals_by_symbol[symbol].get(other_lbl)
-                        if other and other["type"] == sig_type and abs((now - other["time"]).total_seconds()) <= DUAL_MATCH_WINDOW_SECONDS:
-                            strike = engine.get_atm(price, symbol) if price else None
-                            if strike:
-                                m_ok, m_reason = engine.check_momentum(symbol, sig_type)
-                                if m_ok:
-                                    trade, msgs = engine.signal(symbol, strike, "CE" if sig_type == "CALL" else "PE", False, f"DUAL MATCH ({short_lbl} + {other_lbl})")
-                                    for msg in msgs: tg(msg)
-                                    if trade: tg(fmt(trade))
-                                else:
-                                    tg(f"⏳ MOMENTUM WAIT: {symbol} {sig_type} (DUAL MATCH)\nReason: {m_reason}. Re-checking in 60s...")
-                                    asyncio.create_task(engine.delayed_momentum_signal(symbol, strike, "CE" if sig_type == "CALL" else "PE", f"DUAL MATCH ({short_lbl} + {other_lbl})", price, tg, fmt))
-                            engine.last_signals_by_symbol[symbol] = {"2 MIN FLOW": None, "5 MIN FLOW": None}
-
-                    # 4. OTM DUAL MATCH
-                    if symbol in ("BANKNIFTY", "NIFTY"):
-                        otm_sig = engine.get_otm_dual_signal(metrics, short_lbl)
-                        if otm_sig:
-                            if symbol not in engine.last_otm_signals_by_symbol:
-                                engine.last_otm_signals_by_symbol[symbol] = {"2 MIN FLOW": None, "5 MIN FLOW": None}
-                            engine.last_otm_signals_by_symbol[symbol][lbl] = {"type": otm_sig["type"], "time": now}
-                            other_lbl = "5 MIN FLOW" if short_lbl == "2MIN" else "2 MIN FLOW"
-                            other = engine.last_otm_signals_by_symbol[symbol].get(other_lbl)
-                            if other and other["type"] == otm_sig["type"] and abs((now - other["time"]).total_seconds()) <= DUAL_MATCH_WINDOW_SECONDS:
-                                strike = engine.get_atm(price, symbol) if price else None
-                                if strike:
-                                    m_ok, m_reason = engine.check_momentum(symbol, otm_sig["type"])
-                                    if m_ok:
-                                        trade, msgs = engine.signal(symbol, strike, "CE" if otm_sig["type"] == "CALL" else "PE", False, f"OTM DUAL MATCH ({short_lbl} + {other_lbl})")
-                                        for msg in msgs: tg(msg)
-                                        if trade: tg(fmt(trade))
-                                    else:
-                                        tg(f"⏳ MOMENTUM WAIT: {symbol} {otm_sig['type']} (OTM DUAL)\nReason: {m_reason}. Re-checking in 60s...")
-                                        asyncio.create_task(engine.delayed_momentum_signal(symbol, strike, "CE" if otm_sig["type"] == "CALL" else "PE", f"OTM DUAL MATCH ({short_lbl} + {other_lbl})", price, tg, fmt))
-                                engine.last_otm_signals_by_symbol[symbol] = {"2 MIN FLOW": None, "5 MIN FLOW": None}
-                return
-
-            # =====================
-            # KEYWORD SIGNAL DETECTION
-            # =====================
-            cancel_msg = engine.parse_cancel(text)
-            if cancel_msg:
-                tg(cancel_msg)
-                return
-
-            exit_req = engine.parse_exit(text)
-            if exit_req:
-                u, pending = exit_req
-                signal_desc = f"EXIT {u}"
-                for msg in engine.exit_only(u, pending): tg(msg)
-                return
-
-            p = engine.parse(text)
-            if not p:
-                return
-
-            u, s, ot = p
-            source = engine.signal_source(text)
-            signal_desc = f"{u} {s} {ot} ({source})"
-            reverse_confirmed = "REVERSE CONFIRMED" in text.upper() or "FULL OPPOSITE" in text.upper()
-
-            trade, msgs = engine.signal(u, s, ot, reverse_confirmed, source)
-            for msg in msgs: tg(msg)
-            if trade: tg(fmt(trade))
 
         except Exception as e:
             print(f"HANDLER ERROR: {safe(e)}")
