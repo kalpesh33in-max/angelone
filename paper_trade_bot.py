@@ -1274,13 +1274,23 @@ class Engine:
         if self.dup(key):
             return None, msgs
 
-        trade = self.create_trade(
-            u,
-            s,
-            ot,
-            False,
-            signal_source,
-        )
+        try:
+            trade = self.create_trade(
+                u,
+                s,
+                ot,
+                False,
+                signal_source,
+            )
+        except Exception as e:
+            fallback = (
+                f"{u} {s} {ot}\n\n"
+                f"SIGNAL SOURCE: {signal_source or 'CROR'}\n"
+                f"CONTRACT LOOKUP FAILED: {safe(e)}"
+            )
+            print(f"FALLBACK SIGNAL: {fallback}")
+            msgs.append(fallback)
+            return None, msgs
         self.trades[u] = trade
         print("PAPER OPTION TRADE CREATED")
 
