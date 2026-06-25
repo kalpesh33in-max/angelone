@@ -1217,8 +1217,10 @@ class Engine:
         msgs = []
         now = datetime.now(IST)
 
-        if self.paper_entry_block_reason():
-            return None, msgs
+        reason = self.paper_entry_block_reason()
+        if reason:
+            print(f"OUTSIDE WINDOW SIGNAL ALLOWED {u} {s} {ot}: {reason}")
+            msgs.append(f"OUTSIDE WINDOW: {reason}")
 
         if now < self.reverse_wait_until.get(u, now):
             return None, msgs
