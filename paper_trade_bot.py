@@ -297,7 +297,7 @@ def tg(text):
 
     # --- Send to Telegram ---
     try:
-        requests.post(
+        res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
@@ -305,6 +305,8 @@ def tg(text):
             },
             timeout=30,
         )
+        if res.status_code != 200:
+            print(f"TG ERROR: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"TG ERROR: {safe(e)}")
 
@@ -1590,7 +1592,7 @@ async def monitor():
 
 async def main():
 
-    print("BOT START")
+    print("PAPER BOT START")
 
     try:
         engine.login()
@@ -1614,6 +1616,10 @@ async def main():
 
     print(
         f"LISTENING: {SOURCE_CHAT}"
+    )
+    tg(
+        f"PAPER scanner started\n"
+        f"Listening to: {SOURCE_CHAT}"
     )
 
     @client.on(events.NewMessage())
