@@ -1264,10 +1264,16 @@ class Engine:
 
         if side == "BUY":
             sl = price - STOCK_MIS_SL_POINTS
-            targets = [price + STOCK_MIS_TARGET_POINTS]
+            targets = [
+                price + STOCK_MIS_TARGET_POINTS * i
+                for i in range(1, MAX_TARGET + 1)
+            ]
         else:
             sl = price + STOCK_MIS_SL_POINTS
-            targets = [price - STOCK_MIS_TARGET_POINTS]
+            targets = [
+                price - STOCK_MIS_TARGET_POINTS * i
+                for i in range(1, MAX_TARGET + 1)
+            ]
 
         return Trade(
             underlying=u,
@@ -1720,12 +1726,18 @@ engine = Engine()
 
 def fmt(t):
     if t.instrument_kind == "STOCK":
-        return (
-            f"{t.underlying} MIS {t.side} {t.qty} QTY\n"
-            f"ENTRY: {t.entry:.2f}\n"
-            f"SL: {t.sl:.2f}\n"
-            f"TARGET: {t.targets[0]:.2f}"
+        lines = [
+            f"{t.underlying} MIS {t.side} {t.qty} QTY",
+            f"ENTRY: {t.entry:.2f}",
+            f"SL: {t.sl:.2f}",
+        ]
+        lines.extend(
+            f"T{index}: {target:.2f}"
+            for index, target in enumerate(t.targets, 1)
         )
+        if t.signal_source:
+            lines.append(t.signal_source)
+        return "\n".join(lines)
 
     lines = [
         f"{t.underlying} {t.strike} {t.option_type}",
