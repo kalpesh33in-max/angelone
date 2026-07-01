@@ -275,8 +275,8 @@ MAX_TARGET = 5
 MONITOR_DELAY = 3
 DUP_MIN = 10
 REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
-OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "5")
-STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "2")
+OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "0.5")
+STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "0.5")
 STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
 STOCK_MIS_SL_POINTS = env_float("STOCK_MIS_SL_POINTS", "5")
 STOCK_MIS_TARGET_POINTS = env_float("STOCK_MIS_TARGET_POINTS", "10")
@@ -1264,10 +1264,16 @@ class Engine:
 
         if side == "BUY":
             sl = price - STOCK_MIS_SL_POINTS
-            targets = [price + STOCK_MIS_TARGET_POINTS]
+            targets = [
+                price + STOCK_MIS_TARGET_POINTS * i
+                for i in range(1, MAX_TARGET + 1)
+            ]
         else:
             sl = price + STOCK_MIS_SL_POINTS
-            targets = [price - STOCK_MIS_TARGET_POINTS]
+            targets = [
+                price - STOCK_MIS_TARGET_POINTS * i
+                for i in range(1, MAX_TARGET + 1)
+            ]
 
         return Trade(
             underlying=u,
@@ -1301,7 +1307,12 @@ class Engine:
             ]
 
         old_sl = trade.sl
-        if new_sl > trade.sl:
+        should_shift = (
+            new_sl > trade.sl
+            if trade.side == "BUY"
+            else new_sl < trade.sl
+        )
+        if should_shift:
             trade.sl = new_sl
             return old_sl, new_sl
 
@@ -1657,7 +1668,7 @@ class Engine:
                         f"T{target_no} HIT @ {price:.2f}"
                     )
 
-                    if trade.instrument_kind == "OPTION":
+                    if target_no < len(trade.targets):
                         trail_result = self.trail_sl(trade)
                         if trail_result:
                             old_sl, new_sl = trail_result
@@ -1720,12 +1731,18 @@ engine = Engine()
 
 def fmt(t):
     if t.instrument_kind == "STOCK":
-        return (
-            f"{t.underlying} MIS {t.side} {t.qty} QTY\n"
-            f"ENTRY: {t.entry:.2f}\n"
-            f"SL: {t.sl:.2f}\n"
-            f"TARGET: {t.targets[0]:.2f}"
+        lines = [
+            f"{t.underlying} MIS {t.side} {t.qty} QTY",
+            f"ENTRY: {t.entry:.2f}",
+            f"SL: {t.sl:.2f}",
+        ]
+        lines.extend(
+            f"T{index}: {target:.2f}"
+            for index, target in enumerate(t.targets, 1)
         )
+        if t.signal_source:
+            lines.append(t.signal_source)
+        return "\n".join(lines)
 
     lines = [
         f"{t.underlying} {t.strike} {t.option_type}",
