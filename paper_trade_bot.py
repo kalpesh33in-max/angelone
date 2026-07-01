@@ -1,4 +1,4 @@
-kimport asyncio
+import asyncio
 import json
 import os
 import re
@@ -130,10 +130,141 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MATRIX_TOKEN_FILE = os.path.join(BASE_DIR, "matrix_access_token.txt")
 MATRIX_ROOM_ID = env("MATRIX_ROOM_ID", "")
 
+STOCK_OPTION_SYMBOLS = {
+    "ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS",
+    "ADANIPOWER", "AMBUJACEM", "ASHOKLEY", "ASIANPAINT", "AUBANK",
+    "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE",
+    "BANKBARODA", "BEL", "BHARATFORG", "BHARTIARTL", "BHEL",
+    "BPCL", "BRITANNIA", "CGPOWER", "CIPLA", "COALINDIA",
+    "COLPAL", "CUMMINSIND", "DABUR", "DELHIVERY", "DIVISLAB",
+    "DLF", "DRREDDY", "EICHERMOT", "ETERNAL", "GAIL",
+    "GODREJCP", "GODREJPROP", "GRASIM", "HAL", "HCLTECH",
+    "HDFCBANK", "HEROMOTOCO", "HINDALCO", "HINDPETRO", "HINDUNILVR",
+    "HINDZINC", "ICICIBANK", "IDEA", "INDHOTEL", "INDUSINDBK",
+    "INDUSTOWER", "INFY", "IOC", "ITC", "JINDALSTEL",
+    "JSWSTEEL", "KOTAKBANK", "LODHA", "LT", "LUPIN",
+    "M&M", "MANKIND", "MARUTI", "NATIONALUM", "NESTLEIND",
+    "NMDC", "NTPC", "OFSS", "ONGC", "PERSISTENT",
+    "PFC", "PNB", "POWERGRID", "PRESTIGE", "RECLTD",
+    "RELIANCE", "SAIL", "SBIN", "SHREECEM", "SIEMENS",
+    "SUNPHARMA", "SWIGGY", "TATACONSUM", "TATAPOWER", "TATASTEEL",
+    "TCS", "TECHM", "TORNTPHARM", "TRENT", "TVSMOTOR",
+    "ULTRACEMCO", "VEDL", "WIPRO", "ZYDUSLIFE",
+}
+
+STOCK_LOT_DEFAULTS = {
+    "ABB": 125,
+    "ADANIENSOL": 675,
+    "ADANIENT": 309,
+    "ADANIGREEN": 600,
+    "ADANIPORTS": 475,
+    "ADANIPOWER": 3550,
+    "AMBUJACEM": 1200,
+    "ASHOKLEY": 5000,
+    "ASIANPAINT": 250,
+    "AUBANK": 1000,
+    "AUROPHARMA": 550,
+    "AXISBANK": 625,
+    "BAJAJ-AUTO": 75,
+    "BAJAJFINSV": 300,
+    "BAJFINANCE": 750,
+    "BANKBARODA": 2925,
+    "BEL": 1425,
+    "BHARATFORG": 500,
+    "BHARTIARTL": 475,
+    "BHEL": 2625,
+    "BPCL": 1975,
+    "BRITANNIA": 125,
+    "CGPOWER": 850,
+    "CIPLA": 425,
+    "COALINDIA": 1350,
+    "COLPAL": 275,
+    "CUMMINSIND": 200,
+    "DABUR": 1250,
+    "DELHIVERY": 2075,
+    "DIVISLAB": 100,
+    "DLF": 950,
+    "DRREDDY": 625,
+    "EICHERMOT": 100,
+    "ETERNAL": 2425,
+    "GAIL": 3550,
+    "GODREJCP": 500,
+    "GODREJPROP": 325,
+    "GRASIM": 250,
+    "HAL": 150,
+    "HCLTECH": 400,
+    "HDFCBANK": 650,
+    "HEROMOTOCO": 150,
+    "HINDALCO": 700,
+    "HINDPETRO": 2025,
+    "HINDUNILVR": 300,
+    "HINDZINC": 1225,
+    "ICICIBANK": 700,
+    "IDEA": 71475,
+    "INDHOTEL": 1000,
+    "INDUSINDBK": 700,
+    "INDUSTOWER": 1700,
+    "INFY": 400,
+    "IOC": 4875,
+    "ITC": 1725,
+    "JINDALSTEL": 625,
+    "JSWSTEEL": 675,
+    "KOTAKBANK": 2000,
+    "LODHA": 625,
+    "LT": 175,
+    "LUPIN": 425,
+    "M&M": 200,
+    "MANKIND": 250,
+    "MARUTI": 50,
+    "NATIONALUM": 1875,
+    "NESTLEIND": 500,
+    "NMDC": 6750,
+    "NTPC": 1500,
+    "OFSS": 100,
+    "ONGC": 2250,
+    "PERSISTENT": 125,
+    "PFC": 1300,
+    "PNB": 8000,
+    "POWERGRID": 1900,
+    "PRESTIGE": 450,
+    "RECLTD": 1575,
+    "RELIANCE": 500,
+    "SAIL": 4700,
+    "SBIN": 750,
+    "SHREECEM": 25,
+    "SIEMENS": 175,
+    "SUNPHARMA": 350,
+    "SWIGGY": 1825,
+    "TATACONSUM": 550,
+    "TATAPOWER": 1450,
+    "TATASTEEL": 2750,
+    "TCS": 225,
+    "TECHM": 600,
+    "TORNTPHARM": 125,
+    "TRENT": 225,
+    "TVSMOTOR": 175,
+    "ULTRACEMCO": 50,
+    "VEDL": 1150,
+    "WIPRO": 3000,
+    "ZYDUSLIFE": 900,
+}
+
+def lot_env_key(symbol):
+    return re.sub(r"[^A-Z0-9]", "_", symbol.upper()).strip("_")
+
 LOT_SIZES = {
     "NIFTY": env_int("NIFTY_LOT_SIZE", "65"),
     "BANKNIFTY": env_int("BANKNIFTY_LOT_SIZE", "30"),
 }
+LOT_SIZES.update(
+    {
+        symbol: env_int(
+            f"{lot_env_key(symbol)}_LOT_SIZE",
+            str(default),
+        )
+        for symbol, default in STOCK_LOT_DEFAULTS.items()
+    }
+)
 
 # =========================
 # CONFIG
@@ -168,6 +299,23 @@ INDEX_SYMBOLS = {
     "SENSEX",
     "MIDCPNIFTY",
 }
+
+SUPPORTED = INDEX_SYMBOLS | STOCK_OPTION_SYMBOLS
+SUPPORTED_NORMALIZED = sorted(
+    (
+        (re.sub(r"[^A-Z0-9]", "", symbol), symbol)
+        for symbol in SUPPORTED
+    ),
+    key=lambda item: len(item[0]),
+    reverse=True,
+)
+
+def supported_name_from_symbol(value):
+    compact = re.sub(r"[^A-Z0-9]", "", str(value).upper())
+    for normalized, symbol in SUPPORTED_NORMALIZED:
+        if compact.startswith(normalized):
+            return symbol
+    return ""
 
 CROR_OPTION_WRITER_LOTS = env_int("CROR_OPTION_WRITER_LOTS", "500")
 CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
@@ -224,8 +372,7 @@ def tick(v):
     return round(round(float(v) / 0.05) * 0.05, 2)
 
 def trade_step(underlying):
-    return 3 if underlying.upper() in {"HDFCBANK", "ICICIBANK", "RELIANCE"} else 30
-
+    return 3 if underlying.upper() in STOCK_OPTION_SYMBOLS else STEP
 def trade_option_type(option_type):
     return option_type
 
@@ -485,11 +632,21 @@ class Engine:
         self.df = derivatives[
             derivatives["expiry"].dt.date >= today
         ].copy()
+        self.df["symbol"] = self.df["symbol"].astype(str).str.upper().str.strip()
+        raw_name = self.df["name"].astype(str).str.upper().str.strip()
+        inferred = self.df["symbol"].map(supported_name_from_symbol)
+        self.df["name"] = raw_name
+        self.df.loc[~self.df["name"].isin(SUPPORTED), "name"] = inferred
 
         self.spot_df = master[
             (master.exch_seg == "NSE")
             & master.symbol.astype(str).str.endswith("-EQ")
         ].copy()
+        self.spot_df["symbol"] = self.spot_df["symbol"].astype(str).str.upper().str.strip()
+        spot_raw_name = self.spot_df["name"].astype(str).str.upper().str.strip()
+        spot_inferred = self.spot_df["symbol"].map(supported_name_from_symbol)
+        self.spot_df["name"] = spot_raw_name
+        self.spot_df.loc[~self.spot_df["name"].isin(SUPPORTED), "name"] = spot_inferred
 
     # =====================
 
@@ -535,7 +692,7 @@ class Engine:
             turnover = self._cror_value(r"\bTurnover\s*:\s*(?:₹|Rs\.?)?\s*([\d.]+)\s*Cr", block, float)
 
             opt = re.search(
-                r"(?:NFO:)?([A-Z&]+?)(\d{2}[A-Z]{3})(\d{3,6})(CE|PE)\s*\(([^)]*ITM[^)]*)\)",
+                r"(?:NFO:)?([A-Z&-]+?)(\d{2}[A-Z]{3})(\d{3,6})(CE|PE)\s*\(([^)]*ITM[^)]*)\)",
                 up,
             )
 
@@ -586,7 +743,7 @@ class Engine:
                 continue
 
             fut = re.search(
-                r"(?:NFO:)?([A-Z&]+?)(\d{2}[A-Z]{3})FUT\b",
+                r"(?:NFO:)?([A-Z&-]+?)(\d{2}[A-Z]{3})FUT\b",
                 up,
             )
 
@@ -602,7 +759,7 @@ class Engine:
                 if lots >= threshold:
                     if (
                         not is_index
-                        and action not in {"BUYER", "WRITER"}
+                        and action not in {"BUYER", "WRITER", "FUT BUY", "FUT SELL", "BUY", "SELL"}
                     ):
                         continue
 
@@ -822,7 +979,13 @@ class Engine:
                     f"LTP FAILED: missing ltp: {r}"
                 )
 
-            return float(ltp)
+            price = float(ltp)
+            if price <= 0:
+                raise RuntimeError(
+                    f"LTP FAILED: non-positive ltp {price}: {r}"
+                )
+
+            return price
 
         raise RuntimeError(
             f"LTP FAILED: {last}"
