@@ -317,10 +317,12 @@ def supported_name_from_symbol(value):
             return symbol
     return ""
 
-CROR_OPTION_WRITER_LOTS = env_int("CROR_OPTION_WRITER_LOTS", "500")
+CROR_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_NEAR_ITM_LOTS", "700")
+CROR_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_OPTION_WRITER_MID_ITM_LOTS", "500")
+CROR_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_FAR_ITM_LOTS", "300")
 CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
 CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
-CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "1000")
+CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "2000")
 CROR_INDEX_FUT_LOTS = env_int("CROR_INDEX_FUT_LOTS", "3000")
 EXPLOSIVE_OPT_THRESHOLD = 15.0
 LOCK_IN_POINTS = 150
@@ -671,6 +673,16 @@ class Engine:
         except (TypeError, ValueError):
             return default
 
+    def cror_writer_threshold(self, moneyness):
+        up = str(moneyness or "").upper()
+        if "NEAR-ITM" in up:
+            return CROR_OPTION_WRITER_NEAR_ITM_LOTS
+        if "FAR-ITM" in up:
+            return CROR_OPTION_WRITER_FAR_ITM_LOTS
+        if "MID-ITM" in up:
+            return CROR_OPTION_WRITER_MID_ITM_LOTS
+        return CROR_OPTION_WRITER_MID_ITM_LOTS
+
     def parse_cror_alerts(self, text):
         alerts = []
         blocks = re.split(r"\n\s*-{3,}\s*\n", text.strip())
@@ -707,7 +719,7 @@ class Engine:
 
                 threshold = None
                 if action == "WRITER":
-                    threshold = CROR_OPTION_WRITER_LOTS
+                    threshold = self.cror_writer_threshold(moneyness)
                 elif action == "SHORT COVERING":
                     threshold = CROR_OPTION_SHORT_COVERING_LOTS
                 elif action == "BUYER":
