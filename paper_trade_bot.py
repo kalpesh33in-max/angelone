@@ -276,7 +276,11 @@ MONITOR_DELAY = 3
 DUP_MIN = 10
 REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
 OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "0.5")
-OPTION_TARGET_STEP = env_float("OPTION_TARGET_STEP", "0.5")
+# Separate target/SL step to avoid BANKNIFTY index option taking 0.50 targets.
+# Stock options: small premium step default 0.50
+# Index options: bigger premium step default 30 points
+STOCK_OPTION_TARGET_STEP = env_float("STOCK_OPTION_TARGET_STEP", "0.5")
+INDEX_OPTION_TARGET_STEP = env_float("INDEX_OPTION_TARGET_STEP", str(STEP))
 STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "0.5")
 STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
 STOCK_MIS_SL_POINTS = env_float("STOCK_MIS_SL_POINTS", "5")
@@ -1350,10 +1354,16 @@ class Engine:
 
         # CE and PE are both long option-premium trades. Profit happens when
         # the bought option premium rises.
-        # Permanent rule: every OPTION target is based on OPTION_TARGET_STEP
-        # default 0.50. Example entry 10.00 => T1 10.50, T2 11.00,
-        # T3 11.50, T4 12.00, T5 12.50.
-        step = OPTION_TARGET_STEP
+        # Permanent rule:
+        # - Stock options use STOCK_OPTION_TARGET_STEP default 0.50
+        # - Index options use INDEX_OPTION_TARGET_STEP default 30
+        # This prevents BANKNIFTY/NIFTY from taking tiny 0.50 targets while
+        # stock options like PERSISTENT/RELIANCE still get 0.50 target alerts.
+        step = (
+            STOCK_OPTION_TARGET_STEP
+            if u.upper() in STOCK_OPTION_SYMBOLS
+            else INDEX_OPTION_TARGET_STEP
+        )
         sl = max(0.05, price - step)
         targets = [tick(price + step * i) for i in range(1, MAX_TARGET + 1)]
 
@@ -1835,8 +1845,9 @@ class Engine:
                         trade.last_alert = next_level
                         trade.high_price = max(trade.high_price, price)
                         msgs.append(
-                            f"{self.trade_label(trade)} "
-                            f"PRICE UP {next_level:.2f} | LTP {price:.2f}"
+                            f"LTP {price:.2f} OF {trade.strike}{trade.option_type}"
+                            if trade.instrument_kind == "OPTION"
+                            else f"LTP {price:.2f} OF {trade.underlying}"
                         )
                 else:
                     while price <= tick(trade.last_alert - alert_step):
@@ -1844,8 +1855,9 @@ class Engine:
                         trade.last_alert = next_level
                         trade.high_price = min(trade.high_price, price)
                         msgs.append(
-                            f"{self.trade_label(trade)} "
-                            f"PRICE DOWN {next_level:.2f} | LTP {price:.2f}"
+                            f"LTP {price:.2f} OF {trade.strike}{trade.option_type}"
+                            if trade.instrument_kind == "OPTION"
+                            else f"LTP {price:.2f} OF {trade.underlying}"
                         )
 
             except Exception as e:
