@@ -276,13 +276,13 @@ MONITOR_DELAY = 3
 DUP_MIN = 10
 REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
 OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "0.5")
-# Separate target/SL step from tracking alerts.
-# FINAL RULE:
-# - Stock options: SL/T targets use 3 points
-# - Index options: SL/T targets use 30 points
-# - Tracking alerts still use OPTION_PRICE_ALERT_STEP = 0.50
-STOCK_OPTION_TARGET_STEP = env_float("STOCK_OPTION_TARGET_STEP", "3")
-INDEX_OPTION_TARGET_STEP = env_float("INDEX_OPTION_TARGET_STEP", str(STEP))
+# FINAL MONEY-BASED OPTION TARGET RULE:
+# - Option SL/T targets are calculated from rupee risk/reward and lot size.
+# - SL rupees default 900. T1..T5 default 1000,2000,3000,4000,5000.
+# - Point move = rupees / lot_size.
+# - Tracking alerts still use OPTION_PRICE_ALERT_STEP = 0.50 only.
+OPTION_SL_RUPEES = env_float("OPTION_SL_RUPEES", "900")
+OPTION_TARGET_RUPEES_STEP = env_float("OPTION_TARGET_RUPEES_STEP", "1000")
 STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "0.5")
 STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
 STOCK_MIS_SL_POINTS = env_float("STOCK_MIS_SL_POINTS", "5")
@@ -1356,17 +1356,16 @@ class Engine:
 
         # CE and PE are both long option-premium trades. Profit happens when
         # the bought option premium rises.
-        # Permanent rule:
-        # - Stock options use STOCK_OPTION_TARGET_STEP default 3 points for SL/T1..T5
-        # - Index options use INDEX_OPTION_TARGET_STEP default 30 points for SL/T1..T5
-        # - 0.50 is ONLY for simple LTP tracking alerts, not target/SL calculation.
-        step = (
-            STOCK_OPTION_TARGET_STEP
-            if u.upper() in STOCK_OPTION_SYMBOLS
-            else INDEX_OPTION_TARGET_STEP
-        )
-        sl = max(0.05, price - step)
-        targets = [tick(price + step * i) for i in range(1, MAX_TARGET + 1)]
+        # FINAL RULE: calculate SL/T1..T5 from rupee risk/reward and lot size.
+        # Example BANKNIFTY lot 30: Rs1000 target = 1000/30 = 33.33 points.
+        lot_size = int(lot_size) if lot_size else 1
+        sl_points = OPTION_SL_RUPEES / lot_size
+        target_points = OPTION_TARGET_RUPEES_STEP / lot_size
+        sl = max(0.05, tick(price - sl_points))
+        targets = [
+            tick(price + target_points * i)
+            for i in range(1, MAX_TARGET + 1)
+        ]
 
         return Trade(
             underlying=u,
@@ -1892,15 +1891,18 @@ def fmt(t):
         return "\n".join(lines)
 
     lines = [
-        f"{t.underlying} {t.strike} {t.option_type}",
-        f"ENTRY: {t.entry:.2f}",
-        f"SL: {t.sl:.2f}",
+        "🟢 PAPER TRADE",
+        "",
+        f"{t.underlying} {t.strike} {t.option_type} ({t.qty} LOT)",
+        f"ENTRY : {t.entry:.2f}",
+        f"SL    : {t.sl:.2f}   (-₹{OPTION_SL_RUPEES:.0f})",
     ]
     lines.extend(
-        f"T{index}: {target:.2f}"
+        f"T{index}    : {target:.2f}   (+₹{OPTION_TARGET_RUPEES_STEP * index:.0f})"
         for index, target in enumerate(t.targets, 1)
     )
     if t.signal_source:
+        lines.append("")
         lines.append(t.signal_source)
     return "\n".join(lines)
 
