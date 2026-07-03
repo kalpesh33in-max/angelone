@@ -1458,6 +1458,11 @@ class Engine:
             f"{trade.option_type}"
         )
 
+    def ltp_alert_label(self, trade):
+        if trade.instrument_kind == "OPTION":
+            return f"{trade.underlying} {trade.strike}{trade.option_type}"
+        return trade.underlying
+
     # =====================
 
     def close_trade(self, trade, reason, price):
@@ -1834,30 +1839,24 @@ class Engine:
                     else OPTION_PRICE_ALERT_STEP
                 )
                 # Step-price alerts only in profit direction.
-                # BUY example: entry 10.00 -> alert at 10.50, 11.00, 11.50...
-                # If price jumps, send each missed 0.50 level once.
+                # Send ONLY ONE Telegram alert when LTP moves at least 0.50
+                # above the last alerted LTP. Do not repeat the same LTP every poll.
                 if trade.last_alert <= 0:
                     trade.last_alert = trade.entry
 
                 if trade.side == "BUY":
-                    while price >= tick(trade.last_alert + alert_step):
-                        next_level = tick(trade.last_alert + alert_step)
-                        trade.last_alert = next_level
+                    if price >= tick(trade.last_alert + alert_step):
+                        trade.last_alert = price
                         trade.high_price = max(trade.high_price, price)
                         msgs.append(
-                            f"LTP {price:.2f} OF {trade.strike}{trade.option_type}"
-                            if trade.instrument_kind == "OPTION"
-                            else f"LTP {price:.2f} OF {trade.underlying}"
+                            f"LTP {price:.2f} OF {self.ltp_alert_label(trade)}"
                         )
                 else:
-                    while price <= tick(trade.last_alert - alert_step):
-                        next_level = tick(trade.last_alert - alert_step)
-                        trade.last_alert = next_level
+                    if price <= tick(trade.last_alert - alert_step):
+                        trade.last_alert = price
                         trade.high_price = min(trade.high_price, price)
                         msgs.append(
-                            f"LTP {price:.2f} OF {trade.strike}{trade.option_type}"
-                            if trade.instrument_kind == "OPTION"
-                            else f"LTP {price:.2f} OF {trade.underlying}"
+                            f"LTP {price:.2f} OF {self.ltp_alert_label(trade)}"
                         )
 
             except Exception as e:
