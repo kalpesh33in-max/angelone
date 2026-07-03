@@ -276,10 +276,12 @@ MONITOR_DELAY = 3
 DUP_MIN = 10
 REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
 OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "0.5")
-# Separate target/SL step to avoid BANKNIFTY index option taking 0.50 targets.
-# Stock options: small premium step default 0.50
-# Index options: bigger premium step default 30 points
-STOCK_OPTION_TARGET_STEP = env_float("STOCK_OPTION_TARGET_STEP", "0.5")
+# Separate target/SL step from tracking alerts.
+# FINAL RULE:
+# - Stock options: SL/T targets use 3 points
+# - Index options: SL/T targets use 30 points
+# - Tracking alerts still use OPTION_PRICE_ALERT_STEP = 0.50
+STOCK_OPTION_TARGET_STEP = env_float("STOCK_OPTION_TARGET_STEP", "3")
 INDEX_OPTION_TARGET_STEP = env_float("INDEX_OPTION_TARGET_STEP", str(STEP))
 STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "0.5")
 STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
@@ -1355,10 +1357,9 @@ class Engine:
         # CE and PE are both long option-premium trades. Profit happens when
         # the bought option premium rises.
         # Permanent rule:
-        # - Stock options use STOCK_OPTION_TARGET_STEP default 0.50
-        # - Index options use INDEX_OPTION_TARGET_STEP default 30
-        # This prevents BANKNIFTY/NIFTY from taking tiny 0.50 targets while
-        # stock options like PERSISTENT/RELIANCE still get 0.50 target alerts.
+        # - Stock options use STOCK_OPTION_TARGET_STEP default 3 points for SL/T1..T5
+        # - Index options use INDEX_OPTION_TARGET_STEP default 30 points for SL/T1..T5
+        # - 0.50 is ONLY for simple LTP tracking alerts, not target/SL calculation.
         step = (
             STOCK_OPTION_TARGET_STEP
             if u.upper() in STOCK_OPTION_SYMBOLS
