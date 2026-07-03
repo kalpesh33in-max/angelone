@@ -276,6 +276,7 @@ MONITOR_DELAY = 3
 DUP_MIN = 10
 REVERSE_WAIT_SECONDS = env_int("REVERSE_WAIT_SECONDS", "60")
 OPTION_PRICE_ALERT_STEP = env_float("OPTION_PRICE_ALERT_STEP", "0.5")
+OPTION_TARGET_STEP = env_float("OPTION_TARGET_STEP", "0.5")
 STOCK_PRICE_ALERT_STEP = env_float("STOCK_PRICE_ALERT_STEP", "0.5")
 STOCK_MIS_QTY = env_int("STOCK_MIS_QTY", "100")
 STOCK_MIS_SL_POINTS = env_float("STOCK_MIS_SL_POINTS", "5")
@@ -794,11 +795,20 @@ class Engine:
                     continue
 
                 if action == "WRITER":
+                    # Permanent writer conversion rule for ALL index + stock options:
+                    # CE WRITER = bearish call writing, so paper trade BUY PE.
+                    # PE WRITER = bullish put writing, so paper trade BUY CE.
                     signal_ot = "PE" if option_type == "CE" else "CE"
                 else:
+                    # BUYER / SHORT COVERING trade same side option.
                     signal_ot = option_type
 
-                entry_allowed = "NEAR-ITM" not in moneyness
+                # Earlier code blocked fresh NEAR-ITM entries. That caused valid
+                # stock writer alerts like PERSISTENT26JUL4750CE WRITER 751 lots
+                # to be monitored in LTP but NOT converted into Telegram trade.
+                # Now allow WRITER alerts when lots threshold passes, including
+                # NEAR-ITM. Keep NEAR-ITM block only for non-writer alerts.
+                entry_allowed = True if action == "WRITER" else ("NEAR-ITM" not in moneyness)
 
                 alerts.append(
                     {
@@ -1338,11 +1348,14 @@ class Engine:
             token,
         )
 
-        step = trade_step(u)
         # CE and PE are both long option-premium trades. Profit happens when
         # the bought option premium rises.
+        # Permanent rule: every OPTION target is based on OPTION_TARGET_STEP
+        # default 0.50. Example entry 10.00 => T1 10.50, T2 11.00,
+        # T3 11.50, T4 12.00, T5 12.50.
+        step = OPTION_TARGET_STEP
         sl = max(0.05, price - step)
-        targets = [price + step * i for i in range(1, MAX_TARGET + 1)]
+        targets = [tick(price + step * i) for i in range(1, MAX_TARGET + 1)]
 
         return Trade(
             underlying=u,
@@ -1361,6 +1374,7 @@ class Engine:
             side="BUY",
             instrument_kind="OPTION",
             high_price=price,
+            last_alert=price,
             is_reverse=is_reverse,
             signal_source=signal_source,
         )
@@ -1396,6 +1410,7 @@ class Engine:
             side=side,
             instrument_kind="STOCK",
             high_price=price,
+            last_alert=price,
             signal_source=signal_source,
         )
 
@@ -1808,18 +1823,30 @@ class Engine:
                     if trade.instrument_kind == "STOCK"
                     else OPTION_PRICE_ALERT_STEP
                 )
-                favorable_move = (
-                    price >= trade.high_price + alert_step
-                    if trade.side == "BUY"
-                    else price <= trade.high_price - alert_step
-                )
-                if favorable_move:
-                    trade.high_price = price
-                    trade.last_alert = price
-                    msgs.append(
-                        f"{self.trade_label(trade)} "
-                        f"PRICE {price:.2f}"
-                    )
+                # Step-price alerts only in profit direction.
+                # BUY example: entry 10.00 -> alert at 10.50, 11.00, 11.50...
+                # If price jumps, send each missed 0.50 level once.
+                if trade.last_alert <= 0:
+                    trade.last_alert = trade.entry
+
+                if trade.side == "BUY":
+                    while price >= tick(trade.last_alert + alert_step):
+                        next_level = tick(trade.last_alert + alert_step)
+                        trade.last_alert = next_level
+                        trade.high_price = max(trade.high_price, price)
+                        msgs.append(
+                            f"{self.trade_label(trade)} "
+                            f"PRICE UP {next_level:.2f} | LTP {price:.2f}"
+                        )
+                else:
+                    while price <= tick(trade.last_alert - alert_step):
+                        next_level = tick(trade.last_alert - alert_step)
+                        trade.last_alert = next_level
+                        trade.high_price = min(trade.high_price, price)
+                        msgs.append(
+                            f"{self.trade_label(trade)} "
+                            f"PRICE DOWN {next_level:.2f} | LTP {price:.2f}"
+                        )
 
             except Exception as e:
                 print(f"UPDATE ERROR: {safe(e)}")
@@ -2031,9 +2058,17 @@ async def main():
                     active = engine.trades.get(symbol)
                     if not a["entry_allowed"]:
                         if not active:
+                            print(
+                                f"SKIP NEAR-ITM NON-WRITER WITHOUT ACTIVE TRADE: "
+                                f"{symbol} {trade_strike} {a['signal_ot']} {engine.short_cror_source(a)}"
+                            )
                             continue
 
                         if active.option_type == a["signal_ot"]:
+                            print(
+                                f"SKIP SAME-SIDE NEAR-ITM NON-WRITER: "
+                                f"{symbol} {trade_strike} {a['signal_ot']} {engine.short_cror_source(a)}"
+                            )
                             continue
 
                     signal_desc = (
