@@ -557,14 +557,15 @@ class Engine:
 
         nearest_expiry = rows["expiry"].min()
         rows = rows[rows["expiry"] == nearest_expiry].copy()
-        strike_pattern = re.compile(
-            rf"^{re.escape(symbol)}\d{{2}}[A-Z]{{3}}(\d+(?:\.\d+)?){option_type}$"
-        )
         strikes = []
         for contract_symbol in rows.symbol.astype(str):
-            match = strike_pattern.match(contract_symbol)
-            if match:
-                strikes.append(float(match.group(1)))
+            strike = self.contract_strike(
+                contract_symbol,
+                symbol,
+                option_type,
+            )
+            if strike is not None:
+                strikes.append(float(strike))
 
         if not strikes:
             raise RuntimeError(
@@ -654,13 +655,77 @@ class Engine:
 
     def strike_ok(self, u, s):
 
+        try:
+            s = float(s)
+        except (TypeError, ValueError):
+            return False
+
         if u == "NIFTY":
             return 18000 <= s <= 30000
 
         if u == "BANKNIFTY":
             return 35000 <= s <= 70000
 
+        # Stock option strikes are much smaller than index strikes. This also
+        # prevents Angel symbols like RELIANCE28JUL261060PE being treated as
+        # strike 261060. The real strike is 1060; 26 is the expiry year.
+        if u in STOCK_OPTION_SYMBOLS:
+            # All stock option strikes must be realistic. Angel stock symbols
+            # sometimes carry expiry year before strike (example:
+            # RELIANCE28JUL261060PE = 28JUL26 1060 PE).
+            # Never allow huge parsed strike values like 261060 in output.
+            return 1 <= s <= 100000
+
         return True
+
+    def contract_strike(self, contract_symbol, underlying, option_type):
+        """Return the real strike from Angel/NFO option symbols.
+
+        Angel stock option symbols can contain a 2-digit expiry year before
+        the strike, for example RELIANCE28JUL261060PE means:
+        RELIANCE 28JUL26 1060 PE. Older/source alert symbols may be
+        RELIANCE26JUL1300PE without the year before strike. This helper
+        supports both formats and avoids wrong strikes like 261060.
+        """
+        symbol = str(contract_symbol).upper().strip()
+        u = str(underlying).upper().strip()
+        ot = str(option_type).upper().strip()
+
+        m = re.match(
+            rf"^{re.escape(u)}\d{{2}}[A-Z]{{3}}(\d+(?:\.\d+)?){ot}$",
+            symbol,
+        )
+        if not m:
+            return None
+
+        raw = m.group(1)
+        candidates = []
+
+        def add_candidate(value):
+            try:
+                v = float(value)
+                if v.is_integer():
+                    v = int(v)
+                candidates.append(v)
+            except (TypeError, ValueError):
+                pass
+
+        # Full tail as strike, e.g. BANKNIFTY26JUL58100CE or RELIANCE26JUL1300CE
+        add_candidate(raw)
+
+        # Tail with expiry-year removed, e.g. RELIANCE28JUL261060PE -> 1060
+        # or BANKNIFTY30JUL2658100CE -> 58100. Prefer this when the first
+        # two digits look like a year and the reduced strike is valid.
+        if raw.isdigit() and len(raw) > 4 and raw[:2] in {"25", "26", "27", "28", "29", "30"}:
+            add_candidate(raw[2:])
+
+        valid = [v for v in candidates if self.strike_ok(u, v)]
+        if not valid:
+            return None
+
+        # Prefer year-stripped candidate when present. It is always appended
+        # after the raw candidate above.
+        return valid[-1]
 
     # =====================
 
@@ -836,22 +901,44 @@ class Engine:
 
     def resolve(self, u, s, ot):
 
-        df = self.df[
-            (self.df.name == u)
-            & (
-                self.df.symbol.astype(str).str.match(
-                    rf"^{re.escape(u)}\d{{2}}[A-Z]{{3}}{int(s)}{ot}$",
-                    na=False,
-                )
-            )
-        ]
+        u = str(u).upper().strip()
+        ot = str(ot).upper().strip()
+        wanted = int(float(s)) if float(s).is_integer() else float(s)
 
-        if df.empty:
+        rows = self.df[
+            (self.df.name == u)
+            & self.df.symbol.astype(str).str.endswith(ot)
+        ].copy()
+
+        if rows.empty:
             raise RuntimeError(
                 f"SCRIP NOT FOUND: {u} {s} {ot}"
             )
 
-        row = df.sort_values("expiry").iloc[0]
+        matched = []
+        for idx, row in rows.iterrows():
+            strike = self.contract_strike(
+                row.symbol,
+                u,
+                ot,
+            )
+            if strike is None:
+                continue
+            if float(strike) == float(wanted):
+                matched.append(row)
+
+        if not matched:
+            available = []
+            for contract_symbol in rows.sort_values("expiry").symbol.astype(str).head(20):
+                strike = self.contract_strike(contract_symbol, u, ot)
+                if strike is not None:
+                    available.append(f"{contract_symbol}:{strike}")
+            sample = ", ".join(available[:8])
+            raise RuntimeError(
+                f"SCRIP NOT FOUND: {u} {s} {ot}. Parsed sample: {sample}"
+            )
+
+        row = pd.DataFrame(matched).sort_values("expiry").iloc[0]
 
         return (
             row.symbol,
@@ -1236,6 +1323,14 @@ class Engine:
             s,
             ot,
         )
+
+        print(f"RESOLVED OPTION: {u} {s} {ot} -> {sym} token={token}")
+
+        resolved_strike = self.contract_strike(sym, u, ot)
+        if resolved_strike is None or float(resolved_strike) != float(s):
+            raise RuntimeError(
+                f"BAD RESOLVED STRIKE: wanted {u} {s} {ot}, got {sym} parsed={resolved_strike}"
+            )
 
         price = self.ltp(
             ex,
@@ -1909,13 +2004,28 @@ async def main():
                     if not a.get("fut_price"):
                         continue
 
-                    trade_strike = engine.get_atm(
-                        a["fut_price"],
-                        symbol,
-                        a["signal_ot"],
-                    )
+                    # Permanent stock-option fix:
+                    # For stock option CROR alerts, use the strike printed in
+                    # the source alert itself. Do NOT recalculate ATM from
+                    # future price, because Angel stock symbols include expiry
+                    # year before strike and can otherwise resolve bad contracts
+                    # like RELIANCE28JUL261060PE.
+                    # Example source: RELIANCE26JUL1300CE WRITER
+                    # Output trade should be: RELIANCE 1300 PE, not 261060 PE.
+                    if symbol in STOCK_OPTION_SYMBOLS:
+                        trade_strike = a["strike"]
+                    else:
+                        trade_strike = engine.get_atm(
+                            a["fut_price"],
+                            symbol,
+                            a["signal_ot"],
+                        )
 
                     if not engine.strike_ok(symbol, trade_strike):
+                        tg(
+                            f"SKIP BAD STRIKE: {symbol} {trade_strike} {a['signal_ot']}\n"
+                            f"SOURCE: {engine.short_cror_source(a)}"
+                        )
                         continue
 
                     active = engine.trades.get(symbol)
