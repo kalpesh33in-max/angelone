@@ -324,9 +324,9 @@ def supported_name_from_symbol(value):
             return symbol
     return ""
 
-CROR_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_NEAR_ITM_LOTS", "700")
+CROR_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_NEAR_ITM_LOTS", "750")
 CROR_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_OPTION_WRITER_MID_ITM_LOTS", "500")
-CROR_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_FAR_ITM_LOTS", "300")
+CROR_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_FAR_ITM_LOTS", "250")
 CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
 CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
 CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "2000")
@@ -635,8 +635,10 @@ class Engine:
         )
 
         today = datetime.now(IST).date()
+        # Use NSE F&O only. Non-NSE option quotes can resolve to stale/no-trade
+        # contracts for stock options, so never include them in trade resolution.
         derivatives = master[
-            master.exch_seg.isin(["NFO", "BFO"])
+            (master.exch_seg == "NFO")
             & master["expiry"].notna()
         ].copy()
         self.df = derivatives[
@@ -955,6 +957,10 @@ class Engine:
             )
 
         row = pd.DataFrame(matched).sort_values("expiry").iloc[0]
+        if row.exch_seg != "NFO":
+            raise RuntimeError(
+                f"NON-NFO CONTRACT REJECTED: {row.symbol} {row.exch_seg}"
+            )
 
         return (
             row.symbol,
