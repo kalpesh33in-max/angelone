@@ -324,11 +324,17 @@ def supported_name_from_symbol(value):
             return symbol
     return ""
 
-CROR_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_NEAR_ITM_LOTS", "750")
-CROR_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_OPTION_WRITER_MID_ITM_LOTS", "500")
-CROR_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_FAR_ITM_LOTS", "250")
+CROR_INDEX_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_WRITER_NEAR_ITM_LOTS", "1000")
+CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS", "500")
+CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS", "500")
+CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS", "500")
+CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS", "250")
+CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS", "250")
 CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
 CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
+CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS", "1500")
+CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS", "1000")
+CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS", "1000")
 CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "2000")
 CROR_INDEX_FUT_LOTS = env_int("CROR_INDEX_FUT_LOTS", "3000")
 EXPLOSIVE_OPT_THRESHOLD = 15.0
@@ -747,15 +753,43 @@ class Engine:
         except (TypeError, ValueError):
             return default
 
-    def cror_writer_threshold(self, moneyness):
+    def cror_writer_threshold(self, moneyness, is_index=False):
         up = str(moneyness or "").upper()
         if "NEAR-ITM" in up:
-            return CROR_OPTION_WRITER_NEAR_ITM_LOTS
+            return (
+                CROR_INDEX_OPTION_WRITER_NEAR_ITM_LOTS
+                if is_index
+                else CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS
+            )
         if "FAR-ITM" in up:
-            return CROR_OPTION_WRITER_FAR_ITM_LOTS
+            return (
+                CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS
+                if is_index
+                else CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS
+            )
         if "MID-ITM" in up:
-            return CROR_OPTION_WRITER_MID_ITM_LOTS
-        return CROR_OPTION_WRITER_MID_ITM_LOTS
+            return (
+                CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS
+                if is_index
+                else CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS
+            )
+        return (
+            CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS
+            if is_index
+            else CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS
+        )
+
+    def cror_buyer_threshold(self, moneyness, is_index=False):
+        up = str(moneyness or "").upper()
+        if not is_index:
+            return CROR_OPTION_BUYER_LOTS
+        if "NEAR-ITM" in up:
+            return CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS
+        if "FAR-ITM" in up:
+            return CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS
+        if "MID-ITM" in up:
+            return CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS
+        return CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS
 
     def parse_cror_alerts(self, text):
         alerts = []
@@ -787,17 +821,18 @@ class Engine:
                 strike = int(opt.group(3))
                 option_type = opt.group(4)
                 moneyness = opt.group(5)
+                is_index = symbol in INDEX_SYMBOLS
 
                 if lots is None:
                     continue
 
                 threshold = None
                 if action == "WRITER":
-                    threshold = self.cror_writer_threshold(moneyness)
+                    threshold = self.cror_writer_threshold(moneyness, is_index=is_index)
                 elif action == "SHORT COVERING":
                     threshold = CROR_OPTION_SHORT_COVERING_LOTS
                 elif action == "BUYER":
-                    threshold = CROR_OPTION_BUYER_LOTS
+                    threshold = self.cror_buyer_threshold(moneyness, is_index=is_index)
 
                 if threshold is None or lots < threshold:
                     continue
@@ -882,21 +917,33 @@ class Engine:
         return alerts
 
     def short_cror_source(self, a):
-        action_code = {
-            "SHORT COVERING": "S_C",
-            "WRITER": "WR",
-            "BUYER": "BUY",
-        }.get(a["action"], a["action"].replace(" ", "_"))
-        moneyness = re.sub(
-            r"-[\d.]+-DIFF$",
-            "",
-            str(a.get("moneyness", "")),
-            flags=re.IGNORECASE,
-        ).lower()
-        return (
-            f"{action_code} {a['option_type']}-{moneyness} "
-            f"{a['lots']}lots"
-        )
+        action = str(a.get("action", "")).upper()
+        option_type = str(a.get("option_type", "")).upper()
+        lots = a.get("lots", "")
+
+        raw_moneyness = str(a.get("moneyness", "")).upper()
+        moneyness = ""
+        if "NEAR-ITM" in raw_moneyness:
+            moneyness = "NI"
+        elif "MID-ITM" in raw_moneyness:
+            moneyness = "MI"
+        elif "FAR-ITM" in raw_moneyness:
+            moneyness = "FI"
+
+        if action == "SHORT COVERING":
+            return f"SC{option_type} {lots}L"
+
+        if action == "WRITER":
+            if moneyness:
+                return f"W{option_type}-{moneyness}-{lots}L"
+            return f"W{option_type} {lots}L"
+
+        if action == "BUYER":
+            if moneyness:
+                return f"BY{option_type}-{moneyness}-{lots}L"
+            return f"BY{option_type} {lots}L"
+
+        return f"{action.replace(' ', '_')} {option_type} {lots}L"
 
     # =====================
 
