@@ -2011,8 +2011,7 @@ async def main():
         f"LISTENING: {SOURCE_CHAT}"
     )
     tg(
-        f"PAPER scanner started\n"
-        f"Listening to: {SOURCE_CHAT}"
+        "scanner started"
     )
 
     @client.on(events.NewMessage())
