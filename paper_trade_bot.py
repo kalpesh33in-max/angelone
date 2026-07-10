@@ -1927,11 +1927,11 @@ engine = Engine()
 # FORMAT
 # =========================
 
-    def fmt(t):
-        if t.instrument_kind == "STOCK":
-            lines = [
-                f"{t.underlying} MIS {t.side} {t.qty} QTY",
-                f"ENTRY: {t.entry:.2f}",
+def fmt(t):
+    if t.instrument_kind == "STOCK":
+        lines = [
+            f"{t.underlying} MIS {t.side} {t.qty} QTY",
+            f"ENTRY: {t.entry:.2f}",
             f"SL: {t.sl:.2f}",
         ]
         lines.extend(
@@ -1942,9 +1942,7 @@ engine = Engine()
             lines.append(t.signal_source)
         lines.append("")
         lines.append("📢For risk disclosure & disclaimers:-")
-        lines.append(
-            "All information are given only for educational purpose."
-        )
+        lines.append("All information are given only for educational purpose.")
         lines.append(
             "So, it's not advice to trade, pls consult your Financial Advisor."
         )
@@ -1964,9 +1962,7 @@ engine = Engine()
         lines.append(t.signal_source)
     lines.append("")
     lines.append("📢For risk disclosure & disclaimers:-")
-    lines.append(
-        "All information are given only for educational purpose."
-    )
+    lines.append("All information are given only for educational purpose.")
     lines.append(
         "So, it's not advice to trade, pls consult your Financial Advisor."
     )
