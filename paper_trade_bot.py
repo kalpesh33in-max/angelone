@@ -2054,10 +2054,10 @@ async def main():
                         symbol = a["symbol"]
                         if a.get("trade_mode") == "STOCK_SPOT":
                             side = "BUY" if a["action"] == "BUYER" else "SELL"
-                            source = (
-                                f"{a['action'].replace(' ', '_')} "
-                                f"{a['lots']}lots"
-                            )
+                            if a["action"] == "BUYER":
+                                source = f"FBY {a['lots']}L"
+                            else:
+                                source = f"FSL {a['lots']}L"
                             trade, msgs = engine.stock_signal(
                                 symbol,
                                 side,
