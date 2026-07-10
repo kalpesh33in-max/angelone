@@ -1927,11 +1927,11 @@ engine = Engine()
 # FORMAT
 # =========================
 
-def fmt(t):
-    if t.instrument_kind == "STOCK":
-        lines = [
-            f"{t.underlying} MIS {t.side} {t.qty} QTY",
-            f"ENTRY: {t.entry:.2f}",
+    def fmt(t):
+        if t.instrument_kind == "STOCK":
+            lines = [
+                f"{t.underlying} MIS {t.side} {t.qty} QTY",
+                f"ENTRY: {t.entry:.2f}",
             f"SL: {t.sl:.2f}",
         ]
         lines.extend(
@@ -1940,11 +1940,17 @@ def fmt(t):
         )
         if t.signal_source:
             lines.append(t.signal_source)
+        lines.append("")
+        lines.append("📢For risk disclosure & disclaimers:-")
+        lines.append(
+            "All information are given only for educational purpose."
+        )
+        lines.append(
+            "So, it's not advice to trade, pls consult your Financial Advisor."
+        )
         return "\n".join(lines)
 
     lines = [
-        "🟢 PAPER TRADE",
-        "",
         f"{t.underlying} {t.strike} {t.option_type} ({t.qty} LOT)",
         f"ENTRY : {t.entry:.2f}",
         f"SL    : {t.sl:.2f}   (-₹{OPTION_SL_RUPEES:.0f})",
@@ -1956,6 +1962,14 @@ def fmt(t):
     if t.signal_source:
         lines.append("")
         lines.append(t.signal_source)
+    lines.append("")
+    lines.append("📢For risk disclosure & disclaimers:-")
+    lines.append(
+        "All information are given only for educational purpose."
+    )
+    lines.append(
+        "So, it's not advice to trade, pls consult your Financial Advisor."
+    )
     return "\n".join(lines)
 
 # =========================
