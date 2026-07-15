@@ -330,7 +330,6 @@ CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_WRITER_FAR_IT
 CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS", "500")
 CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS", "250")
 CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS", "250")
-CROR_OPTION_SHORT_COVERING_LOTS = env_int("CROR_OPTION_SHORT_COVERING_LOTS", "1000")
 CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
 CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS", "1500")
 CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS", "1000")
@@ -798,7 +797,7 @@ class Engine:
         for block in blocks:
             up = block.upper()
             action = None
-            for candidate in ("SHORT COVERING", "UNWINDING", "FUT BUY", "FUT SELL", "BUYER", "WRITER", "BUY", "SELL"):
+            for candidate in ("UNWINDING", "FUT BUY", "FUT SELL", "BUYER", "WRITER", "BUY", "SELL"):
                 if re.search(rf"\b{candidate}\b", up):
                     action = candidate
                     break
@@ -829,8 +828,6 @@ class Engine:
                 threshold = None
                 if action == "WRITER":
                     threshold = self.cror_writer_threshold(moneyness, is_index=is_index)
-                elif action == "SHORT COVERING":
-                    threshold = CROR_OPTION_SHORT_COVERING_LOTS
                 elif action == "BUYER":
                     threshold = self.cror_buyer_threshold(moneyness, is_index=is_index)
 
@@ -843,7 +840,6 @@ class Engine:
                     # PE WRITER = bullish put writing, so paper trade BUY CE.
                     signal_ot = "PE" if option_type == "CE" else "CE"
                 else:
-                    # BUYER / SHORT COVERING trade same side option.
                     signal_ot = option_type
 
                 # Earlier code blocked fresh NEAR-ITM entries. That caused valid
@@ -894,7 +890,7 @@ class Engine:
                         continue
 
                     signal_ot = None
-                    if action in {"SHORT COVERING", "FUT BUY", "BUY", "BUYER"}:
+                    if action in {"FUT BUY", "BUY", "BUYER"}:
                         signal_ot = "CE"
                     elif action in {"UNWINDING", "FUT SELL", "SELL", "WRITER"}:
                         signal_ot = "PE"
@@ -929,9 +925,6 @@ class Engine:
             moneyness = "MI"
         elif "FAR-ITM" in raw_moneyness:
             moneyness = "FI"
-
-        if action == "SHORT COVERING":
-            return f"SC{option_type} {lots}L"
 
         if action == "WRITER":
             if moneyness:
@@ -2107,22 +2100,11 @@ async def main():
                     if not a.get("fut_price"):
                         continue
 
-                    # Permanent stock-option fix:
-                    # For stock option CROR alerts, use the strike printed in
-                    # the source alert itself. Do NOT recalculate ATM from
-                    # future price, because Angel stock symbols include expiry
-                    # year before strike and can otherwise resolve bad contracts
-                    # like RELIANCE28JUL261060PE.
-                    # Example source: RELIANCE26JUL1300CE WRITER
-                    # Output trade should be: RELIANCE 1300 PE, not 261060 PE.
-                    if symbol in STOCK_OPTION_SYMBOLS:
-                        trade_strike = a["strike"]
-                    else:
-                        trade_strike = engine.get_atm(
-                            a["fut_price"],
-                            symbol,
-                            a["signal_ot"],
-                        )
+                    trade_strike = engine.get_atm(
+                        a["fut_price"],
+                        symbol,
+                        a["signal_ot"],
+                    )
 
                     if not engine.strike_ok(symbol, trade_strike):
                         tg(
