@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 import re
@@ -929,7 +929,7 @@ class Engine:
         if action == "WRITER":
             if moneyness:
                 return f"W{option_type}-{moneyness}-{lots}L"
-            return f"W{option_type} {lots}L"
+            return f"W{option_type}-{lots}L"
 
         if action == "BUYER":
             if moneyness:
@@ -1826,9 +1826,7 @@ class Engine:
                     msgs.extend(exit_msgs)
                     if ok:
                         msgs.append(
-                            f"{self.trade_label(trade)} "
-                            f"SL HIT @ {price:.2f} | "
-                            f"ENTRY {trade.entry:.2f}"
+                            f"⚠️ {self.trade_label(trade)} SL 🛡️ HIT 🛑 @ {price:.2f} | ENTRY {trade.entry:.2f}"
                         )
                         del self.trades[u]
                     continue
@@ -1847,8 +1845,7 @@ class Engine:
                     trade.target_hit += 1
                     target_no = trade.target_hit
                     msgs.append(
-                        f"{self.trade_label(trade)} "
-                        f"T{target_no} HIT @ {price:.2f}"
+                        f"🔥 {self.trade_label(trade)} T{target_no} 🎯 HIT 💰 @ {price:.2f}"
                     )
 
                     if target_no < len(trade.targets):
@@ -1856,8 +1853,7 @@ class Engine:
                         if trail_result:
                             old_sl, new_sl = trail_result
                             msgs.append(
-                                f"{self.trade_label(trade)} "
-                                f"SL {old_sl:.2f} -> {new_sl:.2f}"
+                                f"🔄 {self.trade_label(trade)} SL SHIFT {old_sl:.2f} ->TO -> {new_sl:.2f}"
                             )
 
                     if target_no >= len(trade.targets):
@@ -1869,11 +1865,10 @@ class Engine:
                         msgs.extend(exit_msgs)
                         if ok:
                             msgs.append(
-                                f"{self.trade_label(trade)} "
-                                f"EXIT @ {price:.2f} | TARGET"
+                                f"✅ {self.trade_label(trade)} EXIT @ {price:.2f} | TARGET"
                             )
-                            del self.trades[u]
-                            closed = True
+                        del self.trades[u]
+                        closed = True
                         break
 
                 if closed:
@@ -1923,11 +1918,11 @@ engine = Engine()
 def fmt(t):
     if t.instrument_kind == "STOCK":
         lines = [
-            f"{t.underlying} MIS {t.side} {t.qty} QTY",
-            f"ENTRY: {t.entry:.2f} & SL: {t.sl:.2f}",
+            f"🚨{t.underlying} MIS {t.side} {t.qty} QTY",
+            f"✍️ENTRY : {t.entry:.2f}     &    📉 SL : {t.sl:.2f}",
         ]
         lines.extend(
-            f"T{index}: {target:.2f}"
+            f"🎯T{index} : {target:.2f}"
             for index, target in enumerate(t.targets, 1)
         )
         if t.signal_source:
@@ -1941,15 +1936,14 @@ def fmt(t):
         return "\n".join(lines)
 
     lines = [
-        f"{t.underlying} {t.strike} {t.option_type} ({t.qty} LOT)",
-        f"ENTRY: {t.entry:.2f} & SL: {t.sl:.2f}",
+        f"🚨{t.underlying} {t.strike} {t.option_type} ({t.qty} LOT)",
+        f"✍️ENTRY : {t.entry:.2f}     &    📉 SL : {t.sl:.2f} (-₹{OPTION_SL_RUPEES:.0f})",
     ]
     lines.extend(
-        f"T{index}: {target:.2f}"
+        f"🎯T{index} : {target:.2f} (+₹{OPTION_TARGET_RUPEES_STEP * index:.0f})"
         for index, target in enumerate(t.targets, 1)
     )
     if t.signal_source:
-        lines.append("")
         lines.append(t.signal_source)
     lines.append("")
     lines.append("📢For risk disclosure & disclaimers:-")
@@ -2163,3 +2157,6 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
+
+
