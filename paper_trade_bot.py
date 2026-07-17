@@ -1919,7 +1919,7 @@ def fmt(t):
     if t.instrument_kind == "STOCK":
         lines = [
             f"🚨{t.underlying} MIS {t.side} {t.qty} QTY",
-            f"✍️ENTRY : {t.entry:.2f}     &    📉 SL : {t.sl:.2f}",
+            f"✍️ENTRY : {t.entry:.2f} & 📉 SL : {t.sl:.2f}",
         ]
         lines.extend(
             f"🎯T{index} : {target:.2f}"
@@ -1937,7 +1937,7 @@ def fmt(t):
 
     lines = [
         f"🚨{t.underlying} {t.strike} {t.option_type} ({t.qty} LOT)",
-        f"✍️ENTRY : {t.entry:.2f}     &    📉 SL : {t.sl:.2f} (-₹{OPTION_SL_RUPEES:.0f})",
+        f"✍️ENTRY : {t.entry:.2f} & 📉 SL : {t.sl:.2f} (-₹{OPTION_SL_RUPEES:.0f})",
     ]
     lines.extend(
         f"🎯T{index} : {target:.2f} (+₹{OPTION_TARGET_RUPEES_STEP * index:.0f})"
