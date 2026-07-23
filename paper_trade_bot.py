@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import os
 import re
@@ -332,12 +332,16 @@ CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_WRITER_FAR_IT
 CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS", "750")
 CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS", "500")
 CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS", "250")
-CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "1000")
 CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS", "3000")
 CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS", "3000")
 CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS = env_int("CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS", "3000")
 CROR_STOCK_FUT_LOTS = env_int("CROR_STOCK_FUT_LOTS", "2000")
 CROR_INDEX_FUT_LOTS = env_int("CROR_INDEX_FUT_LOTS", "3000")
+# Common option thresholds used for both index options and stock options.
+CROR_OPTION_WRITER_NEAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_NEAR_ITM_LOTS", "2000")
+CROR_OPTION_WRITER_MID_ITM_LOTS = env_int("CROR_OPTION_WRITER_MID_ITM_LOTS", "750")
+CROR_OPTION_WRITER_FAR_ITM_LOTS = env_int("CROR_OPTION_WRITER_FAR_ITM_LOTS", "500")
+CROR_OPTION_BUYER_LOTS = env_int("CROR_OPTION_BUYER_LOTS", "3000")
 EXPLOSIVE_OPT_THRESHOLD = 15.0
 LOCK_IN_POINTS = 150
 TRAILING_GAP = 120
@@ -757,40 +761,17 @@ class Engine:
     def cror_writer_threshold(self, moneyness, is_index=False):
         up = str(moneyness or "").upper()
         if "NEAR-ITM" in up:
-            return (
-                CROR_INDEX_OPTION_WRITER_NEAR_ITM_LOTS
-                if is_index
-                else CROR_STOCK_OPTION_WRITER_NEAR_ITM_LOTS
-            )
+            return CROR_OPTION_WRITER_NEAR_ITM_LOTS
         if "FAR-ITM" in up:
-            return (
-                CROR_INDEX_OPTION_WRITER_FAR_ITM_LOTS
-                if is_index
-                else CROR_STOCK_OPTION_WRITER_FAR_ITM_LOTS
-            )
+            return CROR_OPTION_WRITER_FAR_ITM_LOTS
         if "MID-ITM" in up:
-            return (
-                CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS
-                if is_index
-                else CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS
-            )
-        return (
-            CROR_INDEX_OPTION_WRITER_MID_ITM_LOTS
-            if is_index
-            else CROR_STOCK_OPTION_WRITER_MID_ITM_LOTS
-        )
+            return CROR_OPTION_WRITER_MID_ITM_LOTS
+        return CROR_OPTION_WRITER_MID_ITM_LOTS
 
     def cror_buyer_threshold(self, moneyness, is_index=False):
-        up = str(moneyness or "").upper()
-        if not is_index:
-            return CROR_OPTION_BUYER_LOTS
-        if "NEAR-ITM" in up:
-            return CROR_INDEX_OPTION_BUYER_NEAR_ITM_LOTS
-        if "FAR-ITM" in up:
-            return CROR_INDEX_OPTION_BUYER_FAR_ITM_LOTS
-        if "MID-ITM" in up:
-            return CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS
-        return CROR_INDEX_OPTION_BUYER_MID_ITM_LOTS
+        # Same buyer threshold for Near-, Mid- and Far-ITM options,
+        # regardless of whether the underlying is an index or a stock.
+        return CROR_OPTION_BUYER_LOTS
 
     def parse_cror_alerts(self, text):
         alerts = []
