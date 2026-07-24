@@ -804,12 +804,28 @@ class Engine:
                 option_type = opt.group(4)
                 moneyness = opt.group(5)
                 is_index = symbol in INDEX_SYMBOLS
+                diff = self._cror_value(
+                    r"\bFAR-ITM\s*-\s*([\d.]+)\s*-\s*DIFF\b",
+                    moneyness,
+                    float,
+                )
 
                 if lots is None:
                     continue
 
                 threshold = None
-                if action == "WRITER":
+                if (
+                    symbol == "BANKNIFTY"
+                    and "FAR-ITM" in moneyness.upper()
+                    and diff is not None
+                ):
+                    if diff > 1000:
+                        threshold = 250
+                    elif action == "BUYER":
+                        threshold = 750
+                    elif action == "WRITER":
+                        threshold = 500
+                elif action == "WRITER":
                     threshold = self.cror_writer_threshold(moneyness, is_index=is_index)
                 elif action == "BUYER":
                     threshold = self.cror_buyer_threshold(moneyness, is_index=is_index)
@@ -846,6 +862,7 @@ class Engine:
                         "fut_price": fut_price,
                         "turnover": turnover,
                         "moneyness": moneyness,
+                        "diff": diff,
                         "threshold": threshold,
                     }
                 )
